@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core"]
+members = ["crates/core", "crates/cli", "crates/daemon"]
 # The BPF crate targets bpfel-unknown-none with a different dependency graph
 # and must be built outside the host workspace.
 exclude = ["crates/bpf"]

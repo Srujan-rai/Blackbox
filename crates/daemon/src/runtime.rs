@@ -1,7 +1,7 @@
 use blackbox_core::history::HistoryRing;
 use blackbox_core::psi::{PressureMonitor, PsiSnapshot, TriggerFired};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Runtime {
     history: HistoryRing,
     monitor: PressureMonitor,
