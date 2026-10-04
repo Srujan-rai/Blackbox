@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+# The BPF crate targets bpfel-unknown-none with a different dependency graph
+# and must be built outside the host workspace.
+exclude = ["crates/bpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/blackbox-rs/blackbox"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+toml = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

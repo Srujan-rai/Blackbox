@@ -1,0 +1,7 @@
+/target
+**/target
+# Compiled BPF object, produced by crates/bpf's build step.
+*.o
+# Sample dumps produced by the daemon or the demo scripts.
+*.bbdump.json
+/examples/*.json

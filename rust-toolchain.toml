@@ -1,0 +1,5 @@
+[toolchain]
+# Host toolchain. Plain stable: the workspace is ordinary userspace Rust.
+channel = "stable"
+
+components = ["rustfmt", "clippy"]

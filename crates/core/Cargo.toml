@@ -1,0 +1,17 @@
+[package]
+name = "blackbox-core"
+description = "Shared event types, pressure-stall detection, trace analysis and Perfetto export for blackbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
