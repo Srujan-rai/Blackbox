@@ -1,0 +1,5 @@
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+# --btf is what makes the object loadable by aya on a kernel whose BTF differs
+# from the one this was built against.
+rustflags = ["-C", "link-arg=--btf"]

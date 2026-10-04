@@ -1,0 +1,31 @@
+[package]
+name = "blackbox-bpf"
+description = "BPF program for blackbox: observes sched_switch into a ring buffer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "blackbox-bpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[profile.dev]
+opt-level = 3
+debug = 2
+panic = "abort"
+incremental = false
+codegen-units = 1
+overflow-checks = true
+debug-assertions = false
+
+[profile.release]
+opt-level = 3
+debug = 2
+panic = "abort"
+incremental = false
+codegen-units = 1
+overflow-checks = true
+debug-assertions = false

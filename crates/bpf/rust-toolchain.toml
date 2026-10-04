@@ -1,0 +1,7 @@
+[toolchain]
+# Nightly, unlike the rest of the workspace. bpfel-unknown-none ships no
+# prebuilt core on any rustup channel, so the target has to be built from
+# source with -Z build-std. Nothing here runs on the host, so the nightly
+# requirement is contained to this directory.
+channel = "nightly"
+components = ["rust-src"]
