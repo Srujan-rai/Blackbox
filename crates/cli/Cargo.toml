@@ -1,0 +1,17 @@
+[package]
+name = "blackbox"
+description = "CLI to manage blackboxd: start, status, dump, report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blackbox-core = { path = "../core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
