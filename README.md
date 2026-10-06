@@ -1,4 +1,4 @@
-# blackbox
+# Blackbox
 
 A minimal, low-overhead scheduler recorder that dumps a trace on pressure stalls.
 
