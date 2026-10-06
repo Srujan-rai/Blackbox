@@ -85,15 +85,27 @@ fn integrity(out: &mut String, dump: &Dump, slices: &[OnCpuSlice]) {
     rule(out, "completeness");
     kv(out, "events", &dump.overhead.events_recorded.to_string());
     kv(out, "on-cpu slices", &slices.len().to_string());
+    // Always state the loss position: "no drops" is only reassuring if the
+    // reader can see the line was considered and came back clean.
     if dump.overhead.events_dropped_kernel > 0 {
+        let dropped = dump.overhead.events_dropped_kernel;
+        // What the kernel could not queue is only knowable against what it
+        // could: kept + dropped is every event that reached the tracepoint.
+        let seen = dropped.saturating_add(dump.overhead.events_recorded);
+        let pct = if seen == 0 {
+            0.0
+        } else {
+            (dropped as f64 / seen as f64) * 100.0
+        };
         kv(
             out,
             "kernel drops",
             &format!(
-                "{} WARNING: trace has holes, totals below are lower bounds",
-                dump.overhead.events_dropped_kernel
+                "{dropped} ({pct:.1}% of events seen) WARNING: trace has holes, totals below are lower bounds"
             ),
         );
+    } else {
+        kv(out, "kernel drops", "0");
     }
     if dump.overhead.events_evicted > 0 {
         kv(
@@ -402,6 +414,23 @@ mod tests {
         let r = render_report(&d);
         assert!(r.contains("WARNING"));
         assert!(r.contains("42"));
+    }
+
+    #[test]
+    fn kernel_drops_are_reported_as_a_share_of_events_seen() {
+        let mut d = sample();
+        d.overhead.events_recorded = 98;
+        d.overhead.events_dropped_kernel = 2;
+        let r = render_report(&d);
+        // 2 dropped out of 100 seen.
+        assert!(r.contains("2.0% of events seen"), "got:\n{r}");
+    }
+
+    #[test]
+    fn a_clean_trace_states_zero_drops_explicitly() {
+        let r = render_report(&sample());
+        assert!(r.contains("kernel drops    0") || r.contains("kernel drops    0\n"));
+        assert!(!r.contains("WARNING"));
     }
 
     #[test]
