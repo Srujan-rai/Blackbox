@@ -9,7 +9,7 @@ use std::path::Path;
 
 pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>)> {
     let mut ebpf = aya::Ebpf::load_file(bpf_obj)?;
-    EbpfLogger::init(&mut ebpf)?;
+    let _ = EbpfLogger::init(&mut ebpf)?;
     let program: &mut TracePoint = ebpf
         .program_mut("sched_switch")
         .ok_or_else(|| anyhow!("program 'sched_switch' not found"))?

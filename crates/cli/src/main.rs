@@ -1,7 +1,7 @@
 use anyhow::Result;
 use blackbox_core::dump::Dump;
 use blackbox_core::perfetto::to_chrome_json;
-use blackbox_core::report::{render_report, render_report_with, ReportOptions};
+use blackbox_core::report::{render_report_with, ReportOptions};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
