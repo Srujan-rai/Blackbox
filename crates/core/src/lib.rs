@@ -14,6 +14,7 @@ pub mod dump;
 pub mod event;
 pub mod history;
 pub mod hostinfo;
+pub mod ipc;
 pub mod oncpu;
 pub mod perfetto;
 pub mod psi;
@@ -23,6 +24,8 @@ pub use config::Config;
 pub use dump::{Dump, DumpEvent, OverheadInfo, TriggerInfo, WindowInfo, SCHEMA_VERSION};
 pub use event::{SchedSwitch, TASK_RUNNING};
 pub use history::HistoryRing;
+pub use hostinfo::{collect, uptime_ns};
+pub use ipc::{DumpResult, Request, Response, StatusInfo, DEFAULT_SOCKET_PATHS, default_socket_path};
 pub use oncpu::{gaps, reconstruct, OnCpuSlice, TaskGap};
 pub use perfetto::to_chrome_json;
 pub use psi::{
