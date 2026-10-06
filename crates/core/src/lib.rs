@@ -25,7 +25,9 @@ pub use dump::{Dump, DumpEvent, OverheadInfo, TriggerInfo, WindowInfo, SCHEMA_VE
 pub use event::{SchedSwitch, TASK_RUNNING};
 pub use history::HistoryRing;
 pub use hostinfo::{collect, uptime_ns};
-pub use ipc::{DumpResult, Request, Response, StatusInfo, DEFAULT_SOCKET_PATHS, default_socket_path};
+pub use ipc::{
+    default_socket_path, DumpResult, Request, Response, StatusInfo, DEFAULT_SOCKET_PATHS,
+};
 pub use oncpu::{gaps, reconstruct, OnCpuSlice, TaskGap};
 pub use perfetto::to_chrome_json;
 pub use psi::{

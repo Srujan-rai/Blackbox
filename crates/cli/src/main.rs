@@ -135,7 +135,9 @@ fn start(config: &Path, foreground: bool) -> Result<()> {
             Ok(Response::Status(info)) => {
                 println!(
                     "blackboxd started (pid {}), listening on {}",
-                    info.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                    info.pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".into()),
                     info.socket
                 );
                 println!("  logs: {}", log_path.display());
@@ -145,10 +147,13 @@ fn start(config: &Path, foreground: bool) -> Result<()> {
             Ok(_) => last_err = "unexpected response".into(),
             Err(e) => last_err = e.to_string(),
         }
-        // The child may have exited already; do not wait the full 5s on it.
+        // The child may have exited already; do not wait the full 5s on it,
+        // and send the reader to the log rather than to socket chatter that
+        // could not have happened.
         if let Some(status) = child.try_wait()? {
             return Err(anyhow::anyhow!(
-                "blackboxd exited immediately ({status}): {last_err}"
+                "blackboxd exited immediately ({status}); see {}",
+                log_path.display()
             ));
         }
     }
@@ -170,7 +175,9 @@ fn print_status(info: StatusInfo) {
     println!("  running         {}", info.running);
     println!(
         "  pid             {}",
-        info.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+        info.pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".into())
     );
     println!(
         "  uptime          {}",
@@ -204,10 +211,7 @@ fn print_status(info: StatusInfo) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Start {
-            config,
-            foreground,
-        } => start(&config, foreground)?,
+        Cmd::Start { config, foreground } => start(&config, foreground)?,
         Cmd::Status => match send_request(&Request::Status)? {
             Response::Status(info) => print_status(info),
             Response::Error(e) => anyhow::bail!(e),

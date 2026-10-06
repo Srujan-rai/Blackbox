@@ -77,10 +77,7 @@ impl Runtime {
     }
 
     pub fn uptime_secs(&self) -> Option<u64> {
-        self.start_time
-            .elapsed()
-            .ok()
-            .map(|d| d.as_secs())
+        self.start_time.elapsed().ok().map(|d| d.as_secs())
     }
 
     pub fn build_dump(&self, trigger_reason: &str, trigger_detail: Option<&str>) -> Dump {
@@ -99,7 +96,10 @@ impl Runtime {
         };
 
         let now = SystemTime::now();
-        let generated_unix_ns = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let generated_unix_ns = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
 
         // Anchor monotonic timestamps to wall time: CLOCK_MONOTONIC runs from
         // boot, and /proc/uptime reports the same origin (minus suspend time,
@@ -199,7 +199,7 @@ impl Runtime {
                 }
             }
             // Newest first, so everything past `keep` is the oldest to delete.
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             if entries.len() > keep as usize {
                 for entry in entries.iter().skip(keep as usize) {
                     let _ = fs::remove_file(&entry.0);
@@ -228,11 +228,13 @@ mod tests {
     }
 
     fn runtime_in(dir: &Path, keep_last: Option<u32>) -> Runtime {
-        let mut config = Config::default();
-        config.dump = DumpConfig {
-            dir: dir.to_path_buf(),
-            keep_last,
-            timestamped_names: false,
+        let config = Config {
+            dump: DumpConfig {
+                dir: dir.to_path_buf(),
+                keep_last,
+                timestamped_names: false,
+            },
+            ..Config::default()
         };
         let history = HistoryRing::new(100, 30);
         Runtime::new(history, PressureMonitor::new(vec![]), config)
@@ -334,18 +336,20 @@ mod tests {
     #[test]
     fn truncated_flag_reflects_eviction() {
         let dir = scratch("truncated");
-        let mut config = Config::default();
-        config.dump = DumpConfig {
-            dir: dir.clone(),
-            keep_last: None,
-            timestamped_names: false,
+        let config = Config {
+            dump: DumpConfig {
+                dir: dir.clone(),
+                keep_last: None,
+                timestamped_names: false,
+            },
+            ..Config::default()
         };
         let mut history = HistoryRing::new(2, 30);
         use blackbox_core::event::SchedSwitch;
         for i in 0..5u64 {
             history.push(SchedSwitch::new(i * 1_000_000_000, 0, 1, 2, 0, b"a", b"b"));
         }
-        let mut rt = Runtime::new(history, PressureMonitor::new(vec![]), config);
+        let rt = Runtime::new(history, PressureMonitor::new(vec![]), config);
         let dump = rt.build_dump("manual", None);
         assert!(dump.window.truncated, "eviction must mark the window");
         assert_eq!(dump.overhead.events_evicted, 3);
@@ -356,7 +360,7 @@ mod tests {
     #[test]
     fn empty_history_yields_an_empty_valid_dump() {
         let dir = scratch("empty");
-        let mut rt = runtime_in(&dir, None);
+        let rt = runtime_in(&dir, None);
         let dump = rt.build_dump("manual", None);
         assert!(dump.events.is_empty());
         assert_eq!(dump.validate(), Ok(()));
