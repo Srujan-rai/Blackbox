@@ -56,7 +56,28 @@ blackbox report trace.bb.json --perfetto > trace.perfetto.json
 # View at https://ui.perfetto.dev/
 ```
 
-The CLI also exposes `start`, `status`, and `dump` subcommands (daemon/runtime scaffolding is in place; full daemon loop to be extended as needed).
+The CLI also exposes `start`, `status`, and `dump` subcommands, which talk to the daemon over a Unix socket:
+
+```bash
+# Start the daemon (detached; use --foreground to keep it in this terminal)
+blackbox start
+
+# Health, ring buffer stats (retained / evicted / kernel drops), last trigger
+blackbox status
+
+# Take a manual dump, into the configured dump dir or a chosen file
+blackbox dump
+blackbox dump --output /tmp/incident.json
+```
+
+The daemon binds the first control socket it can write — `/run/blackbox/blackboxd.sock`, then `/var/run/...`, then `/tmp/...` — so a non-root development run works; `status` reports which one it got. Detached runs log to `/var/log/blackbox/blackboxd.log` (or `/tmp`). Dump retention follows `dump.keep_last` from the config.
+
+Shipped configuration and service files:
+
+- `examples/config.toml` — annotated config covering every knob
+- `contrib/blackboxd.service` — systemd unit (uses `RuntimeDirectory` so the socket and PID file paths exist)
+
+Note that the daemon currently serves the control socket and writes dumps on demand; the continuous BPF drain and PSI polling loop is the next slice.
 
 ## Dump Schema
 

@@ -1,0 +1,25 @@
+# Example blackbox configuration
+
+[history]
+# Maximum number of events to keep in memory
+max_events = 250000
+# Maximum history window in seconds
+max_seconds = 30
+
+[pressure]
+# How often to poll PSI (ms)
+poll_interval_ms = 250
+# CPU pressure trigger
+cpu = { enabled = true, threshold_pct = 80.0, consecutive = 4 }
+# Memory pressure trigger
+memory = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
+# IO pressure trigger
+io = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
+
+[dump]
+# Where to write dump files
+dir = "/var/lib/blackbox/dumps"
+# How many dumps to keep (None = unlimited)
+keep_last = 10
+# Include timestamp in filename
+timestamped_names = true
