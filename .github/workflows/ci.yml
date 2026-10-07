@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Only the newest run for a given ref matters; cancel superseded ones.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins channel "stable" with rustfmt + clippy.
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  bpf:
+    name: Build BPF object
+    runs-on: ubuntu-latest
+    # The BPF crate is excluded from the workspace and lives in its own
+    # invocation, so it gets its own job with the nightly toolchain.
+    env:
+      # Override the repo's stable rust-toolchain.toml: -Z build-std=core is a
+      # nightly feature and needs the rust-src component.
+      RUSTUP_TOOLCHAIN: nightly
+      BPF_LINKER_VERSION: v0.11.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bpf
+          # crates/bpf/.cargo/config.toml sets target-dir = "target".
+          workspaces: crates/bpf -> target
+
+      - name: Install static bpf-linker
+        run: |
+          set -euo pipefail
+          # `cargo install bpf-linker` needs llvm-config and a matching system
+          # LLVM, which is not available here and fails. Use the prebuilt,
+          # statically linked musl binary instead (same version used locally).
+          asset="bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          url="https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/${asset}"
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/bpf-linker.tar.zst "$url"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+          install -m755 /tmp/bpf-linker "$HOME/.cargo/bin/bpf-linker"
+          bpf-linker --version
+          rustc --version
+
+      - name: Build BPF object
+        run: ./crates/bpf/build.sh release
+
+      # build.sh already checks for .BTF; repeat it here so the intent is
+      # explicit in the workflow and the file is inspected in CI output.
+      - name: Assert .BTF section is present
+        run: |
+          set -euo pipefail
+          obj="crates/bpf/target/bpfel-unknown-none/release/blackbox-bpf"
+          ls -l "$obj"
+          file "$obj"
+          readelf -S "$obj" | grep -q '\.BTF'
+          echo "OK: $obj carries .BTF"
+
+      - name: Upload BPF object
+        uses: actions/upload-artifact@v7
+        with:
+          name: blackbox-bpf-object
+          path: crates/bpf/target/bpfel-unknown-none/release/blackbox-bpf
+          if-no-files-found: error

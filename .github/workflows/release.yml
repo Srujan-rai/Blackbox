@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0). Leave empty to build only.'
+        required: false
+        type: string
+
+# Needed to create the GitHub Release and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BPF_LINKER_VERSION: v0.11.1
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            version="$INPUT_TAG"
+          else
+            version="dev-$(git rev-parse --short=7 HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building $version"
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install static bpf-linker
+        run: |
+          set -euo pipefail
+          # `cargo install bpf-linker` needs llvm-config and matching system
+          # LLVM and fails here; use the prebuilt static musl binary instead.
+          asset="bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          url="https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/${asset}"
+          curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/bpf-linker.tar.zst "$url"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+          install -m755 /tmp/bpf-linker "$HOME/.cargo/bin/bpf-linker"
+          bpf-linker --version
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Build BPF object
+        # Force nightly for this step only; rust-toolchain.toml pins stable for
+        # the workspace build above.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: ./crates/bpf/build.sh release
+
+      - name: Package release
+        id: package
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          root="blackbox-${version}-${TARGET}"
+          stage="dist/${root}"
+          bpf_obj="crates/bpf/target/bpfel-unknown-none/release/blackbox-bpf"
+
+          rm -rf dist
+          mkdir -p "${stage}/examples" "${stage}/contrib"
+
+          install -m755 target/release/blackbox   "${stage}/blackbox"
+          install -m755 target/release/blackboxd  "${stage}/blackboxd"
+          install -m644 "$bpf_obj"                "${stage}/blackbox-bpf.o"
+          install -m644 examples/config.toml      "${stage}/examples/config.toml"
+          install -m644 contrib/blackboxd.service "${stage}/contrib/blackboxd.service"
+          install -m644 README.md LICENSE         "${stage}/"
+
+          tar -C dist -czf "dist/${root}.tar.gz" "${root}"
+          ( cd dist && sha256sum "${root}.tar.gz" > "${root}.tar.gz.sha256" )
+
+          # Standalone copy of the BPF object, also attached to the release.
+          install -m644 "$bpf_obj" dist/blackbox-bpf.o
+
+          echo "root=${root}" >> "$GITHUB_OUTPUT"
+          echo "tarball=${root}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      # Uploaded before the release step so a failure to publish still leaves
+      # the built tarball downloadable from the workflow run.
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.root }}
+          path: |
+            dist/${{ steps.package.outputs.tarball }}
+            dist/${{ steps.package.outputs.tarball }}.sha256
+            dist/blackbox-bpf.o
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        # Only create a release for a real tag, or when a tag was supplied.
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Prebuilt binaries for Linux x86_64 (`x86_64-unknown-linux-gnu`).
+
+            ### Requirements
+            - **Kernel:** Linux 5.15 or newer (BPF ring buffer + BTF + PSI).
+            - **Privileges:** loading the BPF program needs `CAP_BPF` and
+              `CAP_PERFMON`, or root. `blackbox report` needs no privileges.
+
+            ### Contents
+            - `blackbox` (CLI) and `blackboxd` (daemon)
+            - `blackbox-bpf.o` (BPF object, carries `.BTF`)
+            - `examples/config.toml`
+            - `contrib/blackboxd.service`
+            - `README.md`, `LICENSE`
+
+            Verify the download against the attached `.sha256` file.
+          files: |
+            dist/${{ steps.package.outputs.tarball }}
+            dist/${{ steps.package.outputs.tarball }}.sha256
+            dist/blackbox-bpf.o
