@@ -1,4 +1,4 @@
-//! The two worker threads: BPF ring buffer drain and PSI polling.
+//! The two worker threads: BPF ring buffer drain and trigger polling.
 //!
 //! Both loops are built the same way on purpose: they wait on something with
 //! a bounded timeout (or sleep in short slices) and re-check the process-wide
@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox_core::event::SchedSwitch;
+use blackbox_core::oom;
 use blackbox_core::psi;
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags};
@@ -151,30 +152,36 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
     eprintln!("blackboxd: collector stopped ({collected} events recorded, {malformed} malformed)");
 }
 
-/// Poll /proc/pressure on the configured interval and write a dump for every
-/// trigger that fires, until the stop flag is set.
+/// Poll `/proc/pressure` and `/proc/vmstat` on the configured interval and
+/// write a dump for every trigger that fires, until the stop flag is set.
 ///
-/// Hysteresis lives entirely in `PressureMonitor` (consecutive samples,
+/// PSI hysteresis lives entirely in `PressureMonitor` (consecutive samples,
 /// re-arm only after the pressure recedes); this loop adds no debouncing of
-/// its own so the configured semantics are the only ones in effect.
-pub fn run_psi(runtime: SharedRuntime) {
+/// its own so the configured semantics are the only ones in effect. OOM is a
+/// discrete counter, so the only state is the previous `oom_kill` value, held
+/// in `OomMonitor`.
+pub fn run_triggers(runtime: SharedRuntime) {
     // Read once: the config is immutable for the daemon's lifetime (no
     // reload), and holding the lock just for this would be pointless.
-    let poll_interval_ms = {
+    let (poll_interval_ms, oom_enabled) = {
         let rt = lock_runtime(&runtime);
-        rt.config().pressure.poll_interval_ms
+        (rt.config().pressure.poll_interval_ms, rt.oom_enabled())
     };
     let poll_interval = Duration::from_millis(poll_interval_ms);
     eprintln!(
-        "blackboxd: polling /proc/pressure every {}ms",
+        "blackboxd: polling /proc/pressure{} every {}ms",
+        if oom_enabled { " and /proc/vmstat" } else { "" },
         poll_interval.as_millis()
     );
 
     // Remember the first failure so a persistent one logs once instead of
     // once per poll (250ms spam would bury everything else).
     let mut psi_broken: Option<String> = None;
+    let mut oom_broken: Option<String> = None;
 
     while !stop_requested() {
+        // PSI first: it is the richer signal, and a PSI read failing must not
+        // stop the OOM counter (the two proc files fail independently).
         match psi::read_snapshot(Path::new("/proc")) {
             Ok(snapshot) => {
                 if let Some(previous) = psi_broken.take() {
@@ -215,9 +222,44 @@ pub fn run_psi(runtime: SharedRuntime) {
                 psi_broken = Some(err.to_string());
             }
         }
+
+        // OOM is independent of PSI, so a failing /proc/pressure must not
+        // silence it. Same no-`continue` rule as above.
+        if oom_enabled {
+            match oom::read_oom_kill(Path::new("/proc")) {
+                Ok(total) => {
+                    if let Some(previous) = oom_broken.take() {
+                        eprintln!(
+                            "blackboxd: OOM counter reads recovered (was failing: {previous})"
+                        );
+                    }
+                    if let Some(fired) = lock_runtime(&runtime).observe_oom(total) {
+                        let mut rt = lock_runtime(&runtime);
+                        match rt.write_oom_dump(&fired) {
+                            Ok(path) => {
+                                eprintln!("blackboxd: OOM trigger fired, wrote {}", path.display())
+                            }
+                            Err(err) => eprintln!(
+                                "blackboxd: OOM trigger fired but the dump failed: {err:#}"
+                            ),
+                        }
+                    }
+                }
+                Err(err) => {
+                    if oom_broken.is_none() {
+                        eprintln!(
+                            "blackboxd: cannot read the OOM counter, no OOM triggers until \
+                             it recovers: {err}"
+                        );
+                    }
+                    oom_broken = Some(err.to_string());
+                }
+            }
+        }
+
         sleep_until_stop(poll_interval);
     }
-    eprintln!("blackboxd: PSI poller stopped");
+    eprintln!("blackboxd: trigger poller stopped");
 }
 
 /// Sleep for `total`, waking early only to check the stop flag.

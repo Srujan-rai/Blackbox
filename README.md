@@ -37,6 +37,9 @@ a handful of triggers, and two export formats.
   `/proc/pressure`, with **hysteresis**: a trigger must stay over threshold for
   a configurable number of consecutive samples and re-arms only once pressure
   actually recedes. No dump storms.
+- **OOM-kill trigger** — watches the kernel's `oom_kill` counter in
+  `/proc/vmstat` and dumps the moment the OOM killer takes a victim, reporting
+  how many kills occurred in the burst. Needs no BPF.
 - **Native, lossless dumps** — JSON with a schema version, trigger reason,
   host identity, window bounds (monotonic *and* wall-clock), and self-overhead
   counters.
@@ -48,8 +51,9 @@ a handful of triggers, and two export formats.
 - **Daemon + CLI over a Unix socket** — `start` / `status` / `dump`, with a
   `--foreground` mode for service managers.
 - **Graceful degradation** — if the BPF program can't load (no object, no
-  privileges, no BTF), the daemon keeps serving status, manual dumps and PSI
-  triggers, and `blackbox status` says exactly why collection is off.
+  privileges, no BTF), the daemon keeps serving status, manual dumps and
+  trigger dumps (PSI + OOM), and `blackbox status` says exactly why collection
+  is off.
 - **Clean shutdown** on `SIGINT`/`SIGTERM`, removing the socket and PID file.
 - **Dump retention** — keep the newest *K* dumps, delete the rest.
 - **systemd unit** and an annotated example config.
@@ -60,10 +64,10 @@ a handful of triggers, and two export formats.
 
 ## Scope
 
-**In (v0.1):** `sched_switch` only; PSI (CPU/memory/IO) + manual triggers;
-bounded history; native dump; text and Perfetto reports.
+**In (v0.1):** `sched_switch` only; PSI (CPU/memory/IO) + OOM + manual
+triggers; bounded history; native dump; text and Perfetto reports.
 
-**Deliberately out (for now):** exec/exit/IO/OOM event sources, on-disk history
+**Deliberately out (for now):** exec/exit/IO event sources, on-disk history
 across daemon restarts, a GUI, remote shipping. See
 [Limitations](#limitations) for the honest edges of what exists today.
 
@@ -76,9 +80,9 @@ across daemon restarts, a GUI, remote shipping. See
 │ tracepoint ──► 64-byte│  ringbuf ────► │   decode ──► HistoryRing           │
 │ record (no helper)    │                │              (last N s / max count)│
 └───────────────────────┘                │                                    │
-                                         │  PSI poller thread ──► trigger ──┐  │
-        /proc/pressure  ────────────────►│   hysteresis in PressureMonitor  │  │
-                                         │                                  ▼  │
+                                         │  trigger poller thread ─► trigger ┐  │
+        /proc/pressure   ───────────────►│   hysteresis in PressureMonitor  │  │
+        /proc/vmstat     ───────────────►│   oom_kill counter in OomMonitor ▼  │
                                          │  IPC thread (Unix socket) ──► write │
       blackbox CLI ──(status/dump)──────►│   status · manual dump · retention  │
                                          └────────────────────────────────────┘
@@ -219,7 +223,7 @@ completeness
 top cpu consumers
 -----------------
    63.72%       2.56s  pid 0        swapper/3
-   10.91%     438.9ms  pid 72208    psi-poller
+   10.91%     438.9ms  pid 72208    trigger-poller
     6.38%     256.5ms  pid 72207    bpf-collector
     3.88%     155.9ms  pid 18589    gnome-terminal-
     3.34%     134.2ms  pid 17068    brave
@@ -232,7 +236,7 @@ longest scheduler delays
        1.8ms  pid 69434    dav1d-worker
 ```
 
-(Note `psi-poller` and `bpf-collector` in the ranking — that is the daemon
+(Note `trigger-poller` and `bpf-collector` in the ranking — that is the daemon
 measuring itself.)
 
 ## CLI reference
@@ -247,9 +251,9 @@ measuring itself.)
 The CLI talks to the daemon over a Unix socket, trying
 `/run/blackbox/blackboxd.sock`, then `/var/run/...`, then `/tmp/blackboxd.sock`,
 so a non-root development run works. The daemon runs the control socket, a
-collector thread and a PSI-poller thread sharing one locked `Runtime`.
+collector thread and a trigger-poller thread sharing one locked `Runtime`.
 
-`blackboxd` itself takes `--config PATH` and `--no-bpf` (IPC + PSI only).
+`blackboxd` itself takes `--config PATH` and `--no-bpf` (IPC + triggers only).
 
 ## Configuration
 
@@ -268,6 +272,7 @@ poll_interval_ms = 250
 cpu    = { enabled = true, threshold_pct = 80.0, consecutive = 4 }
 memory = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
 io     = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
+oom    = { enabled = true }
 
 [dump]
 dir              = "/var/lib/blackbox/dumps"
@@ -280,6 +285,7 @@ timestamped_names = true
 
 `consecutive` is the hysteresis: N samples over threshold before firing. After
 firing, a trigger re-arms only once the reading drops back below the threshold.
+`oom` has no threshold or window — any advance of the `oom_kill` counter fires.
 
 The BPF object is located by, in order: `[bpf].object_path` (a missing file
 here is a startup error), then `BLACKBOX_BPF_OBJECT`, then
@@ -292,8 +298,8 @@ here is a startup error), then `BLACKBOX_BPF_OBJECT`, then
 Dumps are native JSON with `schema_version: 1`. They are self-describing, so a
 trace from last week is still interpretable:
 
-- `trigger` — `reason` (`manual`, `psi_cpu`, `psi_memory`, `psi_io`) and a
-  human `detail`.
+- `trigger` — `reason` (`manual`, `psi_cpu`, `psi_memory`, `psi_io`, `oom`) and
+  a human `detail`.
 - `window` — monotonic and wall-clock endpoints, span, and `truncated` when a
   cap was hit.
 - `overhead` — `events_recorded`, `events_evicted` (our window's own
@@ -351,14 +357,15 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
 ## Testing
 
 ```sh
-cargo test --workspace            # 142 tests, no privileges needed
+cargo test --workspace            # 160 tests, no privileges needed
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite covers PSI parsing and hysteresis, on-CPU interval reconstruction,
-the bounded ring, config validation, dump schema validation, retention, the
-wire-record decoder, the IPC protocol and the text/Perfetto renderers.
+The suite covers PSI parsing and hysteresis, the OOM `oom_kill` counter, on-CPU
+interval reconstruction, the bounded ring, config validation, dump schema
+validation, retention, the wire-record decoder, the IPC protocol and the
+text/Perfetto renderers.
 
 The BPF path is validated on a real kernel in privileged Docker:
 
@@ -386,8 +393,8 @@ sudo scripts/bench.sh   # baseline vs traced overhead on a switch hammer
 ## Repository layout
 
 ```
-crates/core     blackbox-core — pure analysis: events, history, PSI, dumps, reports
-crates/daemon   blackboxd — BPF collector, PSI poller, IPC server
+crates/core     blackbox-core — pure analysis: events, history, PSI/OOM, dumps, reports
+crates/daemon   blackboxd — BPF collector, trigger poller, IPC server
 crates/cli      blackbox — start / status / dump / report
 crates/bench    blackbox-bench — dependency-free workload for the overhead benchmark
 crates/bpf      blackbox-bpf — the tracepoint program (excluded from the workspace)

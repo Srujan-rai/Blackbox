@@ -155,6 +155,7 @@ impl Default for PressureConfig {
 /// cpu    = { threshold_pct = 80.0, consecutive = 4 }
 /// memory = { threshold_pct = 20.0 }
 /// io     = { enabled = false }
+/// oom    = { enabled = true }
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -162,6 +163,9 @@ pub struct PressureTriggers {
     pub cpu: TriggerTuning,
     pub memory: TriggerTuning,
     pub io: TriggerTuning,
+    /// OOM is not a pressure level, so it has no threshold or window: it fires
+    /// on the `oom_kill` counter in `/proc/vmstat` moving at all.
+    pub oom: OomTuning,
 }
 
 impl PressureTriggers {
@@ -184,6 +188,19 @@ impl PressureTriggers {
                 }
             })
             .collect()
+    }
+}
+
+/// OOM kill trigger. Count-based, so the only knob is whether to watch it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OomTuning {
+    pub enabled: bool,
+}
+
+impl Default for OomTuning {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -253,6 +270,7 @@ impl Default for PressureTriggers {
             cpu: TriggerTuning::with_defaults(Resource::Cpu),
             memory: TriggerTuning::with_defaults(Resource::Memory),
             io: TriggerTuning::with_defaults(Resource::Io),
+            oom: OomTuning::default(),
         }
     }
 }
@@ -468,6 +486,37 @@ mod tests {
         for r in Resource::ALL {
             assert_eq!(triggers.iter().filter(|t| t.resource == r).count(), 1);
         }
+    }
+
+    #[test]
+    fn oom_defaults_to_enabled() {
+        assert!(Config::default().pressure.triggers.oom.enabled);
+    }
+
+    #[test]
+    fn oom_can_be_disabled_independently_of_pressure() {
+        let c = Config::from_toml("[pressure]\noom = { enabled = false }\n").unwrap();
+        assert!(!c.pressure.triggers.oom.enabled);
+        // The pressure triggers are untouched by the OOM knob.
+        assert_eq!(c.pressure.triggers.expand().len(), 3);
+        assert!(c.pressure.triggers.cpu.enabled);
+    }
+
+    #[test]
+    fn oom_is_not_a_pressure_resource() {
+        // OOM is count-based, so it must not appear in the pressure trigger
+        // list (which carries thresholds and windows it has no use for).
+        let triggers = Config::default().pressure.triggers.expand();
+        assert!(triggers
+            .iter()
+            .all(|t| t.resource != Resource::Cpu || t.enabled));
+        assert_eq!(triggers.len(), 3);
+    }
+
+    #[test]
+    fn unknown_oom_key_is_rejected() {
+        let err = Config::from_toml("[pressure]\noom = { threshhold = 1.0 }\n").unwrap_err();
+        assert!(err.to_string().contains("threshhold"));
     }
 
     #[test]

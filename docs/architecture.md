@@ -51,9 +51,10 @@ There is no on-disk history, and a crash loses the window.
    pushes it into the history. Records are decoded with `offset_of!`-derived
    offsets and bounds-checked copies, so a short or corrupt record is dropped
    rather than misread.
-3. **PSI poller thread** — reads `/proc/pressure/{cpu,memory,io}` every
-   `pressure.poll_interval_ms`, feeds a `PressureMonitor`, and asks the runtime
-   to write a dump when a trigger fires.
+3. **Trigger-poller thread** — reads `/proc/pressure/{cpu,memory,io}` and the
+   `oom_kill` counter in `/proc/vmstat` every `pressure.poll_interval_ms`, feeds
+   a `PressureMonitor` (hysteresis) and an `OomMonitor` (discrete counter), and
+   asks the runtime to write a dump when either fires.
 
 Every critical section is short (a batch push, a status copy, a dump write), so
 `status` never waits behind a ring-buffer drain. Both workers re-check a
@@ -66,11 +67,12 @@ The daemon prefers to keep serving over dying:
 
 - **A bad config file is fatal.** That is an operator mistake worth stopping
   for, and unknown keys are rejected so a typo never becomes a silent default.
-- **A bad environment is not.** Missing object, no privileges, no BTF, no PSI —
+- **A bad environment is not.** Missing object, no privileges, no BTF, no PSI,
+  no OOM counter —
   each is logged loudly and surfaced in `blackbox status`
-  (`bpf_attached: false` plus a reason). Manual dumps and PSI-triggered dumps
-  still work, and a daemon quietly collecting nothing is exactly the failure the
-  status field exists to make impossible to miss.
+  (`bpf_attached: false` plus a reason). Manual dumps and trigger dumps
+  (PSI/OOM) still work, and a daemon quietly collecting nothing is exactly the
+  failure the status field exists to make impossible to miss.
 
 ## On-CPU interval reconstruction
 

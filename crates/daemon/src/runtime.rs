@@ -1,6 +1,7 @@
 use blackbox_core::config::Config;
 use blackbox_core::dump::{Dump, DumpEvent, HostSnapshot, OverheadInfo, TriggerInfo};
 use blackbox_core::history::HistoryRing;
+use blackbox_core::oom::{OomFired, OomMonitor};
 use blackbox_core::psi::{PressureMonitor, PsiSnapshot, TriggerFired};
 use blackbox_core::{collect as collect_host, uptime_ns};
 use std::fs::{self, File};
@@ -12,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Runtime {
     history: HistoryRing,
     monitor: PressureMonitor,
+    oom: OomMonitor,
     config: Config,
     last_trigger_reason: Option<String>,
     last_trigger_time: Option<u64>, // unix ns
@@ -26,9 +28,11 @@ impl Runtime {
     pub fn new(history: HistoryRing, monitor: PressureMonitor, config: Config) -> Self {
         let proc_root = PathBuf::from("/proc");
         let host_snapshot = collect_host(&proc_root);
+        let oom = OomMonitor::new(config.pressure.triggers.oom.enabled);
         Self {
             history,
             monitor,
+            oom,
             config,
             last_trigger_reason: None,
             last_trigger_time: None,
@@ -42,6 +46,15 @@ impl Runtime {
 
     pub fn observe_psi(&mut self, snapshot: &PsiSnapshot) -> Vec<TriggerFired> {
         self.monitor.observe(snapshot)
+    }
+
+    /// Fold one `oom_kill` counter reading in; `Some` means a new kill happened.
+    pub fn observe_oom(&mut self, total: u64) -> Option<OomFired> {
+        self.oom.observe(total)
+    }
+
+    pub fn oom_enabled(&self) -> bool {
+        self.oom.enabled()
     }
 
     pub fn history_mut(&mut self) -> &mut HistoryRing {
@@ -177,6 +190,16 @@ impl Runtime {
     /// exists without re-deriving the threshold state.
     pub fn write_psi_dump(&mut self, trigger: &TriggerFired) -> anyhow::Result<PathBuf> {
         let dump = self.build_dump(&trigger.reason(), Some(&trigger.describe()));
+        self.write_dump(&dump)
+    }
+
+    /// Build and write a dump for a fired OOM trigger.
+    ///
+    /// Same contract as [`Self::write_psi_dump`]: machine-readable reason
+    /// (`oom`), human-readable detail naming how many kills and the running
+    /// total.
+    pub fn write_oom_dump(&mut self, fired: &OomFired) -> anyhow::Result<PathBuf> {
+        let dump = self.build_dump(&fired.reason(), Some(&fired.describe()));
         self.write_dump(&dump)
     }
 
@@ -442,6 +465,37 @@ mod tests {
             // Writing the dump is what status remembers as "last trigger".
             assert_eq!(rt.last_trigger_reason().as_deref(), Some(expected));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oom_triggers_write_dumps_tagged_with_their_machine_reason() {
+        let dir = scratch("oom-dump");
+        let mut rt = runtime_in(&dir, None);
+        // The first reading only establishes a baseline; no dump for history.
+        assert!(rt.observe_oom(0).is_none());
+        let fired = rt.observe_oom(1).expect("one kill must fire");
+        let path = rt.write_oom_dump(&fired).unwrap();
+        let dump: Dump = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(dump.trigger.reason, "oom");
+        assert_eq!(dump.trigger.detail, fired.describe());
+        assert!(
+            dump.trigger.detail.contains("OOM"),
+            "detail must stay human-readable: {}",
+            dump.trigger.detail
+        );
+        assert_eq!(rt.last_trigger_reason().as_deref(), Some("oom"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oom_burst_is_reported_as_a_count_not_a_boolean() {
+        let dir = scratch("oom-burst");
+        let mut rt = runtime_in(&dir, None);
+        rt.observe_oom(5);
+        let fired = rt.observe_oom(8).expect("three kills");
+        assert_eq!(fired.delta, 3);
+        assert!(fired.describe().contains("3 times"));
         let _ = fs::remove_dir_all(&dir);
     }
 

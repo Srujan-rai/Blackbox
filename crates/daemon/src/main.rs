@@ -32,7 +32,7 @@ use blackbox_core::history::HistoryRing;
 use blackbox_core::ipc::{DumpResult, Request, Response, StatusInfo};
 use blackbox_core::psi::PressureMonitor;
 use blackboxd::collect::{
-    lock_runtime, request_stop, run_collector, run_psi, stop_requested, SharedRuntime,
+    lock_runtime, request_stop, run_collector, run_triggers, stop_requested, SharedRuntime,
 };
 use blackboxd::runtime::Runtime;
 use clap::Parser;
@@ -307,8 +307,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let runtime_for_psi = runtime.clone();
-    workers.push(spawn_worker("psi-poller", move || {
-        run_psi(runtime_for_psi)
+    workers.push(spawn_worker("trigger-poller", move || {
+        run_triggers(runtime_for_psi)
     })?);
 
     // PID file, best-effort: writing it needs a writable /run, which a
@@ -329,7 +329,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Shutdown: signal the workers, then join. Both loops re-check the stop
-    // flag within ~250ms (collector and IPC poll timeouts; the PSI thread
+    // flag within ~250ms (collector and IPC poll timeouts; the trigger thread
     // sleeps in slices), so these joins are bounded in practice. The collector
     // dropping its `Ebpf` handle is what detaches the tracepoint.
     request_stop();

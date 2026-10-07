@@ -27,7 +27,7 @@ The daemon looks for the object in this order:
 5. `./blackbox-bpf.o` (handy when running from the repo)
 
 A *search* that finds nothing is not fatal: the daemon logs it, reports
-`bpf_attached: false`, and keeps serving manual and PSI dumps.
+`bpf_attached: false`, and keeps serving manual and trigger (PSI/OOM) dumps.
 
 ## Tuning the window
 
@@ -45,6 +45,13 @@ fires only after the reading stays over threshold for `consecutive` samples in a
 row, and re-arms only once the reading falls back below threshold. If you see no
 PSI dumps, either nothing crossed the threshold or `keep_last` retention has
 already rotated the old ones out — `blackbox status` shows the last trigger.
+
+The OOM trigger is different: it is a discrete event, so it has no
+`threshold_pct`/`consecutive`. The daemon watches the `oom_kill` counter in
+`/proc/vmstat` and dumps the poll after it advances, reporting how many kills
+happened in the burst. Disable it with `oom = { enabled = false }` under
+`[pressure]`. The first reading after startup only establishes a baseline, so a
+kill that happened before the daemon started is deliberately not reported.
 
 Dumps land in `dump.dir`. With `timestamped_names = true` the filename carries a
 millisecond timestamp, so several dumps in the same second do not overwrite each

@@ -15,6 +15,10 @@ cpu = { enabled = true, threshold_pct = 80.0, consecutive = 4 }
 memory = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
 # IO pressure trigger
 io = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
+# OOM-kill trigger. Unlike PSI this is a discrete event, not a level, so there
+# is no threshold or window: any advance of the kernel's `oom_kill` counter in
+# /proc/vmstat fires a dump.
+oom = { enabled = true }
 
 [dump]
 # Where to write dump files
