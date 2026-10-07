@@ -1,6 +1,8 @@
 //! The raw event record emitted by the BPF program, and the naming details that
 //! the kernel gives us.
 
+use std::mem::offset_of;
+
 /// Length of `TASK_COMM_LEN`. The kernel pads with NULs, and the last byte is
 /// always reserved, so a comm is at most 15 characters.
 pub const COMM_LEN: usize = 16;
@@ -58,6 +60,33 @@ impl SchedSwitch {
         }
     }
 
+    /// Decode one raw ring buffer record.
+    ///
+    /// The BPF program writes this struct into the ring buffer verbatim, so a
+    /// record is exactly `size_of::<SchedSwitch>()` bytes of native-endian
+    /// fields — both halves run on the same machine, so native endianness is
+    /// correct by construction. A wrong-length record is rejected outright
+    /// rather than padded or truncated: a short record would silently misparse
+    /// every field after the gap, which is worse than dropping it.
+    ///
+    /// Fully safe: field offsets come from `offset_of!` (compiler truth, so
+    /// this tracks any layout change) and every copy is bounds-checked, so an
+    /// unaligned or oddly-placed buffer works just as well.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != std::mem::size_of::<Self>() {
+            return None;
+        }
+        Some(Self {
+            ts_ns: u64::from_ne_bytes(field(bytes, offset_of!(Self, ts_ns))?),
+            prev_state: i64::from_ne_bytes(field(bytes, offset_of!(Self, prev_state))?),
+            prev_pid: u32::from_ne_bytes(field(bytes, offset_of!(Self, prev_pid))?),
+            next_pid: u32::from_ne_bytes(field(bytes, offset_of!(Self, next_pid))?),
+            cpu: u32::from_ne_bytes(field(bytes, offset_of!(Self, cpu))?),
+            prev_comm: field(bytes, offset_of!(Self, prev_comm))?,
+            next_comm: field(bytes, offset_of!(Self, next_comm))?,
+        })
+    }
+
     pub fn prev_comm_str(&self) -> &str {
         comm_to_str(&self.prev_comm)
     }
@@ -71,6 +100,14 @@ impl SchedSwitch {
     pub fn was_preempted(&self) -> bool {
         self.prev_state == TASK_RUNNING
     }
+}
+
+/// Copy `N` bytes out of `bytes` at `offset`, or `None` when out of bounds.
+///
+/// Bounds-checked via `get`, so a bad offset returns `None` instead of
+/// panicking inside the daemon's collector thread.
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+    bytes.get(offset..offset + N)?.try_into().ok()
 }
 
 fn comm_bytes(src: &[u8]) -> [u8; COMM_LEN] {
@@ -137,5 +174,89 @@ mod tests {
         let blocked = SchedSwitch::new(0, 0, 1, 2, 1, b"a", b"b");
         assert!(preempted.was_preempted());
         assert!(!blocked.was_preempted());
+    }
+
+    /// Encode an event the way the BPF program lays it out: fields at their
+    /// documented offsets. Written against the documented layout rather than
+    /// `offset_of!` on purpose — if the struct drifts, these two disagree and
+    /// the test fails instead of the parser quietly following the struct away
+    /// from the wire format.
+    fn wire_bytes(ev: &SchedSwitch) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out[0..8].copy_from_slice(&ev.ts_ns.to_ne_bytes());
+        out[8..16].copy_from_slice(&ev.prev_state.to_ne_bytes());
+        out[16..20].copy_from_slice(&ev.prev_pid.to_ne_bytes());
+        out[20..24].copy_from_slice(&ev.next_pid.to_ne_bytes());
+        out[24..28].copy_from_slice(&ev.cpu.to_ne_bytes());
+        out[28..44].copy_from_slice(&ev.prev_comm);
+        out[44..60].copy_from_slice(&ev.next_comm);
+        out
+    }
+
+    #[test]
+    fn field_offsets_match_the_documented_wire_layout() {
+        // Changing any of these changes the ring buffer layout, so it needs a
+        // rebuilt blackbox-bpf.o and a SCHEMA_VERSION bump — same rule as
+        // `wire_size_is_stable`.
+        assert_eq!(offset_of!(SchedSwitch, ts_ns), 0);
+        assert_eq!(offset_of!(SchedSwitch, prev_state), 8);
+        assert_eq!(offset_of!(SchedSwitch, prev_pid), 16);
+        assert_eq!(offset_of!(SchedSwitch, next_pid), 20);
+        assert_eq!(offset_of!(SchedSwitch, cpu), 24);
+        assert_eq!(offset_of!(SchedSwitch, prev_comm), 28);
+        assert_eq!(offset_of!(SchedSwitch, next_comm), 44);
+    }
+
+    #[test]
+    fn from_bytes_round_trips_a_wire_record() {
+        let ev = SchedSwitch::new(
+            1_234_567_890_123,
+            3,
+            42,
+            7,
+            TASK_RUNNING,
+            b"kworker/0:1",
+            b"systemd-journal",
+        );
+        let decoded = SchedSwitch::from_bytes(&wire_bytes(&ev)).expect("record must decode");
+        assert_eq!(decoded, ev);
+        assert_eq!(decoded.prev_comm_str(), "kworker/0:1");
+        assert_eq!(decoded.next_comm_str(), "systemd-journal");
+    }
+
+    #[test]
+    fn from_bytes_tolerates_arbitrary_comm_bytes() {
+        // A task can rename itself to non-UTF-8 bytes; decoding must still
+        // produce the record, with comm decoding degrading separately.
+        let mut ev = SchedSwitch::new(9, 0, 1, 2, -1, b"a", b"b");
+        ev.prev_comm = [0xff; COMM_LEN];
+        ev.prev_state = -5;
+        let decoded = SchedSwitch::from_bytes(&wire_bytes(&ev)).expect("record must decode");
+        assert_eq!(decoded, ev);
+        assert_eq!(decoded.prev_comm_str(), "<non-utf8>");
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_lengths() {
+        let ev = SchedSwitch::new(1, 0, 1, 2, 0, b"a", b"b");
+        let bytes = wire_bytes(&ev);
+        // Too short, too long, and empty: none can be a whole record, and
+        // guessing would corrupt every field after the first gap.
+        assert_eq!(SchedSwitch::from_bytes(&bytes[..63]), None);
+        assert_eq!(SchedSwitch::from_bytes(&bytes[..0]), None);
+        let mut long = bytes.to_vec();
+        long.push(0);
+        assert_eq!(SchedSwitch::from_bytes(&long), None);
+    }
+
+    #[test]
+    fn from_bytes_requires_no_alignment() {
+        // Ring buffer items are aligned in practice, but a parser that only
+        // works on aligned input invites unsafe or copy bugs elsewhere; this
+        // one copies field by field, so any offset works.
+        let ev = SchedSwitch::new(77, 2, 5, 6, 1, b"prev", b"next");
+        let mut buf = [0u8; 65];
+        buf[1..65].copy_from_slice(&wire_bytes(&ev));
+        assert_eq!(SchedSwitch::from_bytes(&buf[1..]), Some(ev));
     }
 }

@@ -189,6 +189,20 @@ fn print_status(info: StatusInfo) {
     println!("  config          {}", info.config_path);
     println!("  dump dir        {}", info.dump_dir);
     println!();
+    // Collection state gets its own block: a daemon that is up but not
+    // collecting is the failure people actually need to notice, and burying
+    // it under the ring buffer counters would hide exactly that.
+    if info.bpf_attached {
+        println!("bpf collection    attached");
+    } else {
+        println!("bpf collection    NOT attached");
+        match &info.bpf_error {
+            Some(err) => println!("  reason          {err}"),
+            // No verdict yet: the collector thread has not finished loading.
+            None => println!("  reason          starting up (no verdict yet)"),
+        }
+    }
+    println!();
     println!("ring buffer");
     println!("  events retained {}", info.events_recorded);
     println!("  history evicted {}", info.events_evicted);

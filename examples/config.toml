@@ -23,3 +23,14 @@ dir = "/var/lib/blackbox/dumps"
 keep_last = 10
 # Include timestamp in filename
 timestamped_names = true
+
+[bpf]
+# Path to the compiled BPF object. Leave unset to search, in order:
+#   1. the BLACKBOX_BPF_OBJECT environment variable
+#   2. /usr/local/lib/blackbox/blackbox-bpf.o
+#   3. /usr/lib/blackbox/blackbox-bpf.o
+#   4. ./blackbox-bpf.o
+# A path set here that is missing is a startup error; a search that finds
+# nothing is reported in `blackbox status` and the daemon runs without BPF
+# collection (manual dumps and PSI triggers still work).
+# object_path = "/usr/local/lib/blackbox/blackbox-bpf.o"

@@ -18,6 +18,8 @@ pub struct Runtime {
     kernel_drops: u64,
     start_time: SystemTime,
     host_snapshot: HostSnapshot,
+    bpf_attached: bool,
+    bpf_error: Option<String>,
 }
 
 impl Runtime {
@@ -33,6 +35,8 @@ impl Runtime {
             kernel_drops: 0,
             start_time: SystemTime::now(),
             host_snapshot,
+            bpf_attached: false,
+            bpf_error: None,
         }
     }
 
@@ -58,6 +62,24 @@ impl Runtime {
 
     pub fn kernel_drops(&self) -> u64 {
         self.kernel_drops
+    }
+
+    /// Record whether BPF collection is live and, when it is not, why not.
+    ///
+    /// Kept on the runtime rather than beside the collector thread so that
+    /// `blackbox status` reads counters and collection state from one
+    /// consistent snapshot under a single lock.
+    pub fn set_bpf_status(&mut self, attached: bool, error: Option<String>) {
+        self.bpf_attached = attached;
+        self.bpf_error = error;
+    }
+
+    pub fn bpf_attached(&self) -> bool {
+        self.bpf_attached
+    }
+
+    pub fn bpf_error(&self) -> &Option<String> {
+        &self.bpf_error
     }
 
     pub fn last_trigger_reason(&self) -> &Option<String> {
@@ -147,9 +169,23 @@ impl Runtime {
         }
     }
 
+    /// Build and write a dump for a fired PSI trigger.
+    ///
+    /// The reason is machine-readable ([`TriggerFired::reason`], e.g.
+    /// `psi_memory`); the detail is the human sentence from
+    /// [`TriggerFired::describe`], so a report can say exactly why this dump
+    /// exists without re-deriving the threshold state.
+    pub fn write_psi_dump(&mut self, trigger: &TriggerFired) -> anyhow::Result<PathBuf> {
+        let dump = self.build_dump(&trigger.reason(), Some(&trigger.describe()));
+        self.write_dump(&dump)
+    }
+
     pub fn write_dump(&mut self, dump: &Dump) -> anyhow::Result<PathBuf> {
         let filename = if self.config.dump.timestamped_names {
-            let ts = dump.generated_unix_ns / 1_000_000_000;
+            // Milliseconds, not seconds: a machine-wide stall can trip the CPU,
+            // memory and I/O triggers within the same second, and second-granular
+            // names would let the second dump silently overwrite the first.
+            let ts = dump.generated_unix_ns / 1_000_000;
             format!("blackbox-{}.json", ts)
         } else {
             "blackbox.json".to_string()
@@ -373,6 +409,83 @@ mod tests {
         let dir = scratch("uptime");
         let rt = runtime_in(&dir, None);
         assert!(rt.uptime_secs().is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn psi_triggers_write_dumps_tagged_with_their_machine_reason() {
+        use blackbox_core::psi::{AvgWindow, Resource};
+
+        let dir = scratch("psi-dump");
+        let mut rt = runtime_in(&dir, None);
+        for (resource, expected) in [
+            (Resource::Cpu, "psi_cpu"),
+            (Resource::Memory, "psi_memory"),
+            (Resource::Io, "psi_io"),
+        ] {
+            let trigger = TriggerFired {
+                resource,
+                window: AvgWindow::Avg10,
+                value_pct: 41.25,
+                threshold_pct: 20.0,
+                consecutive: 4,
+            };
+            let path = rt.write_psi_dump(&trigger).unwrap();
+            let dump: Dump = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(dump.trigger.reason, expected);
+            assert_eq!(dump.trigger.detail, trigger.describe());
+            assert!(
+                dump.trigger.detail.starts_with("psi "),
+                "detail must stay human-readable: {}",
+                dump.trigger.detail
+            );
+            // Writing the dump is what status remembers as "last trigger".
+            assert_eq!(rt.last_trigger_reason().as_deref(), Some(expected));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bpf_status_defaults_to_not_attached_and_round_trips() {
+        let dir = scratch("bpf-status");
+        let mut rt = runtime_in(&dir, None);
+        // Before any collector thread reports in: not attached, no reason yet.
+        assert!(!rt.bpf_attached());
+        assert_eq!(rt.bpf_error(), &None);
+        rt.set_bpf_status(true, None);
+        assert!(rt.bpf_attached());
+        assert_eq!(rt.bpf_error(), &None);
+        rt.set_bpf_status(false, Some("no blackbox-bpf.o found".into()));
+        assert!(!rt.bpf_attached());
+        assert_eq!(rt.bpf_error().as_deref(), Some("no blackbox-bpf.o found"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timestamped_dumps_a_millisecond_apart_do_not_overwrite_each_other() {
+        // A machine-wide stall can fire several triggers in the same second;
+        // second-granular names would lose all but the first dump.
+        let dir = scratch("dump-ms");
+        let config = Config {
+            dump: DumpConfig {
+                dir: dir.clone(),
+                keep_last: None,
+                timestamped_names: true,
+            },
+            ..Config::default()
+        };
+        let mut rt = Runtime::new(
+            HistoryRing::new(100, 30),
+            PressureMonitor::new(vec![]),
+            config,
+        );
+        let first = rt.build_dump("psi_cpu", Some("first"));
+        let mut second = rt.build_dump("psi_memory", Some("second"));
+        second.generated_unix_ns = first.generated_unix_ns + 1_000_000;
+        let path_a = rt.write_dump(&first).unwrap();
+        let path_b = rt.write_dump(&second).unwrap();
+        assert_ne!(path_a, path_b, "1ms apart must be distinct names");
+        assert!(path_a.exists() && path_b.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

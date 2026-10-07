@@ -230,6 +230,14 @@ pub struct TriggerFired {
 }
 
 impl TriggerFired {
+    /// Machine-readable dump reason for this trigger, e.g. `psi_memory`.
+    ///
+    /// This is what lands in `Dump::trigger::reason`, so tooling can group
+    /// dumps by cause without parsing the human sentence in [`Self::describe`].
+    pub fn reason(&self) -> String {
+        format!("psi_{}", self.resource.as_str())
+    }
+
     /// One-line human-readable explanation, embedded verbatim in the dump.
     pub fn describe(&self) -> String {
         format!(
@@ -513,6 +521,26 @@ mod tests {
             f.describe(),
             "psi memory avg10=41.25% >= 20.00% for 4 consecutive samples"
         );
+    }
+
+    #[test]
+    fn fired_trigger_reason_is_a_machine_readable_resource_tag() {
+        // Reports and dump filenames key off these exact strings, so they are
+        // part of the contract, not an accident of formatting.
+        for (resource, expected) in [
+            (Resource::Cpu, "psi_cpu"),
+            (Resource::Memory, "psi_memory"),
+            (Resource::Io, "psi_io"),
+        ] {
+            let f = TriggerFired {
+                resource,
+                window: AvgWindow::Avg10,
+                value_pct: 41.25,
+                threshold_pct: 20.0,
+                consecutive: 4,
+            };
+            assert_eq!(f.reason(), expected);
+        }
     }
 
     #[test]

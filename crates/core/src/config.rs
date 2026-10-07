@@ -14,12 +14,95 @@ use crate::psi::{AvgWindow, PressureTrigger, Resource};
 /// Default configuration file location.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/blackbox/config.toml";
 
+/// Environment variable naming the BPF object, consulted after an explicit
+/// `[bpf].object_path` and before the built-in search list.
+pub const BPF_OBJECT_ENV: &str = "BLACKBOX_BPF_OBJECT";
+
+/// Where the BPF object is looked for when nothing names one explicitly.
+///
+/// The order is deliberate: a daemon started by systemd has no useful working
+/// directory, so the packaged install location comes first; a developer
+/// running from the repo root gets `./blackbox-bpf.o` last.
+pub const DEFAULT_BPF_OBJECT_PATHS: &[&str] = &[
+    "/usr/local/lib/blackbox/blackbox-bpf.o",
+    "/usr/lib/blackbox/blackbox-bpf.o",
+    "./blackbox-bpf.o",
+];
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub history: HistoryConfig,
     pub pressure: PressureConfig,
     pub dump: DumpConfig,
+    pub bpf: BpfConfig,
+}
+
+/// Where to find the compiled BPF object (`blackbox-bpf.o`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BpfConfig {
+    /// Explicit path to the object. `None` means search: `BLACKBOX_BPF_OBJECT`
+    /// and then [`DEFAULT_BPF_OBJECT_PATHS`]. A path that is set but missing
+    /// fails startup (caught by [`Config::validate`]) rather than falling
+    /// back — silently ignoring a typo would defeat the point of naming one.
+    pub object_path: Option<PathBuf>,
+}
+
+impl BpfConfig {
+    /// Resolve which BPF object to load.
+    ///
+    /// Order, first hit wins:
+    /// 1. `[bpf].object_path` — explicit, so a missing file is an error rather
+    ///    than a fallthrough.
+    /// 2. `env_path` — normally `Some` only when `BLACKBOX_BPF_OBJECT` is set;
+    ///    treated as explicit for the same reason.
+    /// 3. `search` — the built-in locations. Finding nothing here is an
+    ///    environment problem rather than a bad config file, so the caller
+    ///    reports it (status, log) and runs degraded instead of exiting.
+    pub fn resolve_object(&self, env_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+        self.resolve_object_among(env_path, DEFAULT_BPF_OBJECT_PATHS)
+    }
+
+    /// [`Self::resolve_object`] against an explicit candidate list; split out
+    /// so tests can exercise the search logic without depending on which
+    /// files happen to exist on the build machine.
+    fn resolve_object_among(
+        &self,
+        env_path: Option<&Path>,
+        search: &[&str],
+    ) -> Result<PathBuf, ConfigError> {
+        if let Some(path) = &self.object_path {
+            return if path.is_file() {
+                Ok(path.clone())
+            } else {
+                Err(ConfigError::BpfObject(format!(
+                    "bpf.object_path {} does not exist or is not a file",
+                    path.display()
+                )))
+            };
+        }
+        if let Some(path) = env_path {
+            return if path.is_file() {
+                Ok(path.to_path_buf())
+            } else {
+                Err(ConfigError::BpfObject(format!(
+                    "{BPF_OBJECT_ENV} points at {}, which does not exist or is not a file",
+                    path.display()
+                )))
+            };
+        }
+        for candidate in search {
+            let path = Path::new(candidate);
+            if path.is_file() {
+                return Ok(path.to_path_buf());
+            }
+        }
+        Err(ConfigError::BpfObject(format!(
+            "no blackbox-bpf.o found (tried {}); set [bpf].object_path or {BPF_OBJECT_ENV}",
+            search.join(", ")
+        )))
+    }
 }
 
 /// How much scheduler history to keep in memory.
@@ -211,6 +294,12 @@ pub enum ConfigError {
     },
     #[error("invalid configuration: {0}")]
     Invalid(String),
+    /// Locating the BPF object failed. Unlike the variants above this is
+    /// usually the environment (nothing installed, no privileges path to it)
+    /// rather than a malformed config file, so the daemon reports it and
+    /// degrades instead of refusing to start.
+    #[error("{0}")]
+    BpfObject(String),
 }
 
 impl Config {
@@ -266,6 +355,20 @@ impl Config {
                     "trigger for {} has threshold_pct {} outside 0..=100",
                     t.resource.as_str(),
                     t.threshold_pct
+                )));
+            }
+        }
+        // An explicitly named BPF object that is missing is a config mistake
+        // (typo, stale path), and a daemon quietly collecting nothing would be
+        // the worst way to discover it — the same reasoning as
+        // `deny_unknown_fields` above. When no path is named, "nothing
+        // installed yet" is an environment condition instead, and resolution
+        // reports it to status while the daemon keeps serving.
+        if let Some(path) = &self.bpf.object_path {
+            if !path.is_file() {
+                return Err(ConfigError::Invalid(format!(
+                    "bpf.object_path {} does not exist or is not a file",
+                    path.display()
                 )));
             }
         }
@@ -419,5 +522,135 @@ mod tests {
         let err = Config::load(Path::new("/nonexistent/blackbox.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::Io { .. }));
         assert!(err.to_string().contains("blackbox.toml"));
+    }
+
+    /// A scratch file that certainly exists, for BPF object-path tests.
+    fn scratch_object(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bb-bpf-object-{tag}-{}-{:?}.o",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "").unwrap();
+        path
+    }
+
+    #[test]
+    fn bpf_section_parses() {
+        let c = Config::from_toml("[bpf]\nobject_path = \"/opt/bb/blackbox-bpf.o\"\n").unwrap();
+        assert_eq!(
+            c.bpf.object_path,
+            Some(PathBuf::from("/opt/bb/blackbox-bpf.o"))
+        );
+    }
+
+    #[test]
+    fn config_without_a_bpf_section_keeps_the_default() {
+        // Existing configs predate the section, so absence must mean "search"
+        // and never a parse error.
+        let c = Config::from_toml("[history]\nmax_seconds = 60\n").unwrap();
+        assert_eq!(c.bpf, BpfConfig::default());
+        assert_eq!(c.bpf.object_path, None);
+    }
+
+    #[test]
+    fn unknown_bpf_key_is_rejected() {
+        let err = Config::from_toml("[bpf]\nobject_pathz = \"/x\"\n").unwrap_err();
+        assert!(err.to_string().contains("object_pathz"));
+    }
+
+    #[test]
+    fn explicit_object_path_that_exists_is_used_verbatim() {
+        let path = scratch_object("explicit");
+        let c = Config {
+            bpf: BpfConfig {
+                object_path: Some(path.clone()),
+            },
+            ..Config::default()
+        };
+        assert!(c.validate().is_ok());
+        // The search list is irrelevant once a path is named.
+        assert_eq!(c.bpf.resolve_object(None).unwrap(), path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn explicit_object_path_that_is_missing_is_fatal_to_the_config() {
+        let c = Config {
+            bpf: BpfConfig {
+                object_path: Some(PathBuf::from("/nonexistent/blackbox-bpf.o")),
+            },
+            ..Config::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("blackbox-bpf.o"));
+        // Resolution reports the same condition under the non-fatal variant,
+        // for callers that have not run validate.
+        let err = c.bpf.resolve_object(None).unwrap_err();
+        assert!(matches!(err, ConfigError::BpfObject(_)));
+        assert!(err.to_string().contains("blackbox-bpf.o"));
+    }
+
+    #[test]
+    fn env_object_is_preferred_over_the_search_list() {
+        let env = scratch_object("env");
+        let hit = scratch_object("hit");
+        let c = Config::default();
+        let found = c
+            .bpf
+            .resolve_object_among(Some(&env), &[hit.to_str().unwrap()])
+            .unwrap();
+        assert_eq!(found, env, "explicit env must win over search");
+        let found = c
+            .bpf
+            .resolve_object_among(None, &[hit.to_str().unwrap()])
+            .unwrap();
+        assert_eq!(found, hit, "search applies only without an explicit path");
+        let _ = std::fs::remove_file(&env);
+        let _ = std::fs::remove_file(&hit);
+    }
+
+    #[test]
+    fn env_object_that_is_missing_names_the_variable() {
+        let err = Config::default()
+            .bpf
+            .resolve_object_among(Some(Path::new("/nonexistent/bb.o")), &[])
+            .unwrap_err();
+        assert!(err.to_string().contains(BPF_OBJECT_ENV));
+    }
+
+    #[test]
+    fn search_list_is_tried_in_order() {
+        let first = scratch_object("first");
+        let second = scratch_object("second");
+        let missing = "/nonexistent/blackbox-bpf.o";
+        let c = Config::default();
+        let found = c
+            .bpf
+            .resolve_object_among(
+                None,
+                &[missing, first.to_str().unwrap(), second.to_str().unwrap()],
+            )
+            .unwrap();
+        assert_eq!(found, first, "first existing candidate must win");
+        let found = c
+            .bpf
+            .resolve_object_among(None, &[second.to_str().unwrap(), first.to_str().unwrap()])
+            .unwrap();
+        assert_eq!(found, second, "order is honoured, not preference");
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+    }
+
+    #[test]
+    fn search_miss_lists_every_candidate_and_the_escape_hatches() {
+        let err = Config::default()
+            .bpf
+            .resolve_object_among(None, &["/nope/a.o", "/nope/b.o"])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/nope/a.o") && msg.contains("/nope/b.o"));
+        assert!(msg.contains(BPF_OBJECT_ENV));
+        assert!(msg.contains("[bpf].object_path"));
     }
 }

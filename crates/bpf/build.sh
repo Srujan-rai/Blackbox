@@ -48,3 +48,11 @@ if ! readelf -S "$obj" | grep -q '\.BTF'; then
 fi
 
 echo "built $obj ($(stat -c%s "$obj") bytes, .BTF present)"
+
+# Drop a copy where the daemon's default search and the docs expect it
+# (`./blackbox-bpf.o`, matched by the repo's `*.o` gitignore). Without this the
+# daemon finds nothing and runs degraded, which is easy to mistake for a
+# privileges problem.
+repo_root="$(cd "$here/../.." && pwd)"
+install -m644 "$obj" "$repo_root/blackbox-bpf.o"
+echo "installed $repo_root/blackbox-bpf.o"

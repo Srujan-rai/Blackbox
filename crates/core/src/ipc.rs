@@ -30,6 +30,19 @@ pub struct StatusInfo {
     pub socket: String,
     pub dump_dir: String,
     pub config_path: String,
+    /// Whether the BPF program is attached and events are flowing.
+    ///
+    /// False is a legitimate state (no privileges, no object, `--no-bpf`), but
+    /// it must be visible: a daemon quietly collecting nothing is exactly the
+    /// failure this field exists to prevent.
+    #[serde(default)]
+    pub bpf_attached: bool,
+    /// Why collection is not live when `bpf_attached` is false. `None` while
+    /// the collector thread is still starting up. `#[serde(default)]` so this
+    /// CLI still parses a status reply from an older daemon that lacks both
+    /// fields.
+    #[serde(default)]
+    pub bpf_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +85,8 @@ mod tests {
             socket: "/run/blackbox/blackboxd.sock".into(),
             dump_dir: "/var/lib/blackbox/dumps".into(),
             config_path: "/etc/blackbox/config.toml".into(),
+            bpf_attached: true,
+            bpf_error: None,
         });
         let text = serde_json::to_string(&resp).unwrap();
         match serde_json::from_str::<Response>(&text).unwrap() {
@@ -79,6 +94,51 @@ mod tests {
                 assert_eq!(s.pid, Some(42));
                 assert_eq!(s.events_dropped_kernel, 1);
                 assert_eq!(s.last_trigger_reason.as_deref(), Some("manual"));
+                assert!(s.bpf_attached);
+                assert_eq!(s.bpf_error, None);
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_status_round_trips_with_its_reason() {
+        let resp = Response::Status(StatusInfo {
+            bpf_attached: false,
+            bpf_error: Some("no blackbox-bpf.o found".into()),
+            ..StatusInfo::default()
+        });
+        let text = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&text).unwrap() {
+            Response::Status(s) => {
+                assert!(!s.bpf_attached);
+                assert_eq!(s.bpf_error.as_deref(), Some("no blackbox-bpf.o found"));
+            }
+            other => panic!("expected status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_json_from_an_older_daemon_without_bpf_fields_still_parses() {
+        // A new CLI talking to a pre-collection daemon must not fail on the
+        // missing keys; it should read as "not attached, no reason given".
+        let mut value = serde_json::to_value(Response::Status(StatusInfo {
+            running: true,
+            ..StatusInfo::default()
+        }))
+        .unwrap();
+        let obj = value
+            .get_mut("Status")
+            .expect("externally tagged")
+            .as_object_mut()
+            .expect("object");
+        obj.remove("bpf_attached");
+        obj.remove("bpf_error");
+        match serde_json::from_value::<Response>(value).unwrap() {
+            Response::Status(s) => {
+                assert!(s.running);
+                assert!(!s.bpf_attached);
+                assert_eq!(s.bpf_error, None);
             }
             other => panic!("expected status, got {other:?}"),
         }
