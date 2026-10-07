@@ -90,14 +90,16 @@ jobs:
           bpf_obj="crates/bpf/target/bpfel-unknown-none/release/blackbox-bpf"
 
           rm -rf dist
-          mkdir -p "${stage}/examples" "${stage}/contrib"
+          mkdir -p "${stage}/examples" "${stage}/contrib" "${stage}/scripts"
 
-          install -m755 target/release/blackbox   "${stage}/blackbox"
-          install -m755 target/release/blackboxd  "${stage}/blackboxd"
-          install -m644 "$bpf_obj"                "${stage}/blackbox-bpf.o"
-          install -m644 examples/config.toml      "${stage}/examples/config.toml"
-          install -m644 contrib/blackboxd.service "${stage}/contrib/blackboxd.service"
-          install -m644 README.md LICENSE         "${stage}/"
+          install -m755 target/release/blackbox       "${stage}/blackbox"
+          install -m755 target/release/blackboxd      "${stage}/blackboxd"
+          install -m755 target/release/blackbox-bench "${stage}/blackbox-bench"
+          install -m644 "$bpf_obj"                    "${stage}/blackbox-bpf.o"
+          install -m644 examples/config.toml          "${stage}/examples/config.toml"
+          install -m644 contrib/blackboxd.service     "${stage}/contrib/blackboxd.service"
+          install -m755 scripts/demo.sh scripts/bench.sh "${stage}/scripts/"
+          install -m644 README.md LICENSE             "${stage}/"
 
           tar -C dist -czf "dist/${root}.tar.gz" "${root}"
           ( cd dist && sha256sum "${root}.tar.gz" > "${root}.tar.gz.sha256" )
@@ -142,6 +144,8 @@ jobs:
             ### Contents
             - `blackbox` (CLI) and `blackboxd` (daemon)
             - `blackbox-bpf.o` (BPF object, carries `.BTF`)
+            - `blackbox-bench` (workload for the overhead benchmark)
+            - `scripts/demo.sh`, `scripts/bench.sh`
             - `examples/config.toml`
             - `contrib/blackboxd.service`
             - `README.md`, `LICENSE`

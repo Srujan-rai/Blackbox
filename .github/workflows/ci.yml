@@ -39,6 +39,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Check scripts parse
+        run: bash -n scripts/*.sh
+
       - name: Test
         run: cargo test --workspace
 

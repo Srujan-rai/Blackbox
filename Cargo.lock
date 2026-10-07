@@ -141,6 +141,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackbox-bench"
+version = "0.1.0"
+
+[[package]]
 name = "blackbox-core"
 version = "0.1.0"
 dependencies = [

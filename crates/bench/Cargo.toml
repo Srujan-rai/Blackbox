@@ -1,0 +1,21 @@
+[package]
+name = "blackbox-bench"
+description = "Reproducible scheduler workload used to measure blackbox's overhead"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "blackbox-bench"
+path = "src/main.rs"
+
+# std only on purpose: the workload must build anywhere and add no noise of its
+# own. Overhead numbers are only meaningful if the thing being measured is
+# trivial.
+[dependencies]
+
+[lints]
+workspace = true

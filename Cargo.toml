@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/daemon"]
+members = ["crates/core", "crates/cli", "crates/daemon", "crates/bench"]
 # The BPF crate targets bpfel-unknown-none with a different dependency graph
 # and must be built outside the host workspace.
 exclude = ["crates/bpf"]
@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/blackbox-rs/blackbox"
+repository = "https://github.com/Srujan-rai/Blackbox"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

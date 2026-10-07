@@ -53,6 +53,10 @@ a handful of triggers, and two export formats.
 - **Clean shutdown** on `SIGINT`/`SIGTERM`, removing the socket and PID file.
 - **Dump retention** — keep the newest *K* dumps, delete the rest.
 - **systemd unit** and an annotated example config.
+- **Reproducible demo and overhead benchmark** — [`scripts/demo.sh`](scripts/demo.sh)
+  runs the whole flow end to end; [`scripts/bench.sh`](scripts/bench.sh) measures
+  the daemon's cost on a scheduler-heavy workload (results in
+  [`docs/overhead.md`](docs/overhead.md)).
 
 ## Scope
 
@@ -97,6 +101,24 @@ Two design decisions matter:
 On-CPU intervals are rebuilt per CPU from consecutive switches, using
 `prev_state` to separate *scheduler latency* (a runnable task lost the CPU —
 `prev_state == 0`) from *blocked time* (the task slept or waited on I/O).
+
+## Overhead
+
+Blackbox reads every `sched_switch`, so it is not free — its cost scales with
+the **machine-wide** context-switch rate, not with CPU load. Measured on an
+8-core host tracing a workload that does nothing but switch (400k switches per
+run):
+
+- the workload ran **~1.5×** slower (**+50–63 %**), i.e. **~1.5 µs added per
+  switch** the workload caused;
+- the daemon itself used **~0.6 of one core**;
+- a **compute-bound** control was essentially untouched (blackbox runs no code
+  on compute).
+
+Writing that benchmark immediately found a real bug — a PSI poller that spun
+because a `continue` skipped its sleep — and fixing it cut daemon CPU from 1.6
+to 0.6 cores. Full method, raw numbers, caveats and the reproduction commands
+are in [`docs/overhead.md`](docs/overhead.md).
 
 ## Requirements
 
@@ -354,16 +376,25 @@ docker run --rm --privileged --pid=host \
 This is how the tracepoint offsets and the licence requirement below were
 caught — neither is visible from unit tests.
 
+Two scripts drive the same real kernel end to end (both need root):
+
+```sh
+sudo scripts/demo.sh    # start → load → status → dump → report → Perfetto
+sudo scripts/bench.sh   # baseline vs traced overhead on a switch hammer
+```
+
 ## Repository layout
 
 ```
 crates/core     blackbox-core — pure analysis: events, history, PSI, dumps, reports
 crates/daemon   blackboxd — BPF collector, PSI poller, IPC server
 crates/cli      blackbox — start / status / dump / report
+crates/bench    blackbox-bench — dependency-free workload for the overhead benchmark
 crates/bpf      blackbox-bpf — the tracepoint program (excluded from the workspace)
+scripts/        reproducible demo and overhead benchmark
 examples/       annotated config
 contrib/        systemd unit
-docs/           design notes
+docs/           design notes (architecture, operations, overhead)
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and a BPF build on every

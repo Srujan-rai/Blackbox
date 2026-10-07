@@ -180,13 +180,16 @@ pub fn run_psi(runtime: SharedRuntime) {
                 if let Some(previous) = psi_broken.take() {
                     eprintln!("blackboxd: PSI reads recovered (was failing: {previous})");
                 }
-                // Short lock for evaluation...
+                // Short lock for evaluation, then one lock per dump, so a
+                // status request only waits for the dump being written right
+                // now, not all of them.
+                //
+                // Nothing in this arm may `continue`: the sleep lives at the
+                // bottom of the loop, so continuing here would skip it and spin
+                // the poller at full speed (reading /proc/pressure and taking
+                // the runtime lock in a tight loop). An empty `fired` is the
+                // common case and is simply a no-op `for`.
                 let fired = lock_runtime(&runtime).observe_psi(&snapshot);
-                if fired.is_empty() {
-                    continue;
-                }
-                // ...then one lock per dump, so a status request only waits
-                // for the dump being written right now, not all of them.
                 for trigger in fired {
                     let mut rt = lock_runtime(&runtime);
                     match rt.write_psi_dump(&trigger) {

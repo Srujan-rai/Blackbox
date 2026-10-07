@@ -13,10 +13,13 @@ use std::collections::VecDeque;
 
 use crate::event::SchedSwitch;
 
-/// Default window: 30 seconds of history at up to 250k events.
+/// Default window: up to 250k events, 30 seconds wide.
 ///
-/// 250k `sched_switch` events is roughly 8k/s, comfortably above what a busy
-/// 64-core box generates, and costs 16 MB.
+/// The count cap is the one that usually binds. A busy multi-core machine
+/// emits hundreds of thousands to millions of `sched_switch` events per
+/// second (an 8-core desktop under load is ~1M/s), so 250k events is a few
+/// hundred milliseconds, not 30 seconds. 16 MB of memory buys that window;
+/// raise `max_events` for a wider one, and watch `evicted` to see the cap.
 pub const DEFAULT_MAX_EVENTS: usize = 250_000;
 pub const DEFAULT_MAX_SECONDS: u64 = 30;
 
