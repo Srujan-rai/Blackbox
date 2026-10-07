@@ -1,4 +1,5 @@
-//! The BPF half of blackbox: observe `sched_switch`, publish to a ring buffer.
+//! The BPF half of blackbox: observe `sched_switch` and process lifecycle
+//! (fork/exec/exit), and publish to two ring buffers.
 //!
 //! Deliberately minimal. Everything hard -- reconstructing intervals, ranking
 //! consumers, deciding whether a trace is complete -- happens in
@@ -24,9 +25,11 @@
 #![no_main]
 
 use aya_ebpf::helpers::gen::bpf_ktime_get_ns;
+use aya_ebpf::helpers::{bpf_get_current_comm, bpf_probe_read_kernel_str_bytes};
 use aya_ebpf::macros::{map, tracepoint};
 use aya_ebpf::maps::RingBuf;
 use aya_ebpf::programs::TracePointContext;
+use aya_ebpf::EbpfContext;
 
 /// Ring buffer shared with userspace.
 ///
@@ -55,6 +58,36 @@ const _: () = assert!(core::mem::size_of::<SchedSwitch>() == 64);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size((EVENTS_LEN * 8) as u32, 0);
+
+/// Lifecycle ring buffer (fork/exec/exit). Far smaller than `EVENTS`: these
+/// events are rare compared to context switches, and 512 KiB absorbs any burst
+/// (a fork bomb) while the daemon drains.
+const LIFECYCLE_BYTES: u32 = 1 << 19;
+
+#[map]
+static LIFECYCLE: RingBuf = RingBuf::with_byte_size(LIFECYCLE_BYTES, 0);
+
+/// Wire `kind` values, mirrored in blackbox_core::lifecycle.
+pub const KIND_FORK: u32 = 0;
+pub const KIND_EXEC: u32 = 1;
+pub const KIND_EXIT: u32 = 2;
+
+/// The record written for every lifecycle event. Must stay byte-identical to
+/// blackbox_core::lifecycle::LifecycleRecord (64 bytes, offsets below).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Lifecycle {
+    pub ts_ns: u64,
+    pub value: i64,
+    pub kind: u32,
+    pub pid: u32,
+    pub peer_pid: u32,
+    pub _pad: u32,
+    pub comm: [u8; 16],
+    pub name: [u8; 16],
+}
+
+const _: () = assert!(core::mem::size_of::<Lifecycle>() == 64);
 
 #[tracepoint]
 pub fn sched_switch(ctx: TracePointContext) -> u32 {
@@ -116,6 +149,141 @@ pub fn sched_switch(ctx: TracePointContext) -> u32 {
     // `events_dropped_kernel` in the dump reports.
     let _ = EVENTS.output(&ev, 0);
 
+    0
+}
+
+/// Try to publish a lifecycle record. Failure (kernel-side ring full) drops it;
+/// same reasoning as `EVENTS.output`.
+fn emit_lifecycle(ev: &Lifecycle) {
+    let _ = LIFECYCLE.output(ev, 0);
+}
+
+/// Copy a tracepoint `__data_loc` string (the low 16 bits hold the byte offset
+/// from the start of the record) into a capped NUL-terminated buffer.
+///
+/// The string lives in the trace entry itself — kernel memory — so the kernel
+/// string reader is the right helper. A bogus offset (e.g. the field was
+/// zeroed or the record is from an unexpected layout) yields an empty name
+/// rather than a dropped event: the process identity is in `pid` either way.
+fn read_data_loc_name(ctx: &TracePointContext, loc: u32) -> [u8; 16] {
+    let mut name = [0u8; 16];
+    let off = (loc & 0xffff) as usize;
+    if off == 0 {
+        return name;
+    }
+    let src = unsafe { (ctx.as_ptr() as *const u8).add(off) };
+    let _ = unsafe { bpf_probe_read_kernel_str_bytes(src, &mut name) };
+    // bpf_probe_read_kernel_str_bytes NUL-terminates within `name` on success;
+    // a failure leaves zeros. Force the final byte so the buffer always ends.
+    name[15] = 0;
+    name
+}
+
+/// `fork` — a new task was created. Offsets match
+/// /sys/kernel/tracing/events/sched/sched_process_fork/format:
+///   common header                    0..8
+///   parent_comm[16]                   8
+///   parent_pid (pid_t)               24
+///   child_comm[16]                   28
+///   child_pid (pid_t)                44
+#[tracepoint]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    let parent_comm: [u8; 16] = match unsafe { ctx.read_at(8) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let parent_pid: u32 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let child_comm: [u8; 16] = match unsafe { ctx.read_at(28) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let child_pid: u32 = match unsafe { ctx.read_at(44) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    emit_lifecycle(&Lifecycle {
+        ts_ns: unsafe { bpf_ktime_get_ns() },
+        value: 0,
+        kind: KIND_FORK,
+        pid: parent_pid,
+        peer_pid: child_pid,
+        _pad: 0,
+        comm: parent_comm,
+        name: child_comm,
+    });
+    0
+}
+
+/// `exec` — a process replaced its image. Offsets match
+/// /sys/kernel/tracing/events/sched/sched_process_exec/format:
+///   common header                    0..8
+///   filename (__data_loc)            8
+///   pid (pid_t)                     12
+///   old_pid (pid_t)                 16
+#[tracepoint]
+pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
+    let filename_loc: u32 = match unsafe { ctx.read_at(8) } {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    let pid: u32 = match unsafe { ctx.read_at(12) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let old_pid: u32 = match unsafe { ctx.read_at(16) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let comm = match bpf_get_current_comm() {
+        Ok(c) => c,
+        Err(_) => [0u8; 16],
+    };
+    emit_lifecycle(&Lifecycle {
+        ts_ns: unsafe { bpf_ktime_get_ns() },
+        value: 0,
+        kind: KIND_EXEC,
+        pid,
+        peer_pid: old_pid,
+        _pad: 0,
+        comm,
+        name: read_data_loc_name(&ctx, filename_loc),
+    });
+    0
+}
+
+/// `exit` — a task is exiting. Offsets match
+/// /sys/kernel/tracing/events/sched/sched_process_exit/format:
+///   common header                    0..8
+///   comm[16]                         8
+///   pid (pid_t)                     24
+///   prio (int)                      28
+#[tracepoint]
+pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
+    let comm: [u8; 16] = match unsafe { ctx.read_at(8) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let pid: u32 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let prio: i32 = match unsafe { ctx.read_at(28) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    emit_lifecycle(&Lifecycle {
+        ts_ns: unsafe { bpf_ktime_get_ns() },
+        value: prio as i64,
+        kind: KIND_EXIT,
+        pid,
+        peer_pid: 0,
+        _pad: 0,
+        comm,
+        name: [0u8; 16],
+    });
     0
 }
 

@@ -4,9 +4,9 @@ Blackbox is three pieces with one job each:
 
 | Piece | Runs as | Responsibility |
 |---|---|---|
-| `blackbox-bpf` | kernel (BPF) | Observe `sched_switch`, stamp a CPU id, copy a fixed 64-byte record into a ring buffer. Nothing else. |
-| `blackboxd` | userspace daemon | Drain the ring buffer into a bounded history window, poll PSI, answer the control socket, write dumps. |
-| `blackbox-core` | library | All analysis and formatting: interval reconstruction, PSI hysteresis, dump schema, reports. |
+| `blackbox-bpf` | kernel (BPF) | Observe `sched_switch` and the process lifecycle (fork/exec/exit), stamp a CPU id, copy fixed 64-byte records into two ring buffers. Nothing else. |
+| `blackboxd` | userspace daemon | Drain the ring buffers into bounded history windows, poll PSI + the OOM counter, answer the control socket, write dumps. |
+| `blackbox-core` | library | All analysis and formatting: interval reconstruction, PSI hysteresis, lifecycle decoding, dump schema, reports. |
 
 The split is deliberate: everything hard and everything testable lives in
 `blackbox-core`, which needs no privileges and runs in unit tests. The BPF
@@ -29,6 +29,11 @@ The retained window is the **smaller** of the two. On a quiet machine the time
 cap wins; on a busy one the event cap does. A dump records which cap was hit
 (`window.truncated`) and how many events were evicted (`overhead.events_evicted`).
 
+Lifecycle events get their own bounded window (`LifecycleRing`) with the same
+two caps. They are orders of magnitude rarer than context switches, so in
+practice the count cap never binds and a fork storm is the thing that makes it
+evict (visible as `overhead.lifecycle_evicted`).
+
 The honest consequence: **history exists only while `blackboxd` is running.**
 There is no on-disk history, and a crash loses the window.
 
@@ -36,6 +41,10 @@ There is no on-disk history, and a crash loses the window.
    sched_switch                    ringbuf (8 MB)              VecDeque (bounded)
    ─────────────  ──output()──►   ─────────────  ──drain──►  ──────────────────► dump
    per context switch              transport only              the actual history
+
+   fork/exec/exit                  ringbuf (512 KB)            VecDeque (bounded)
+   ─────────────────  ──output──►  ─────────────  ──drain──►  ──────────────────► dump
+   per process event               transport only              the actual history
 ```
 
 ## Threads
@@ -46,11 +55,12 @@ There is no on-disk history, and a crash loses the window.
    line-delimited JSON request, sends one response, closes. Requests are rare
    (a human typing `status` or `dump`), so a connection table would be pure
    overhead and a crashed client could otherwise leave daemon state behind.
-2. **Collector thread** — waits on the ring buffer with a bounded timeout,
-   drains a batch, decodes each record with `SchedSwitch::from_bytes`, and
-   pushes it into the history. Records are decoded with `offset_of!`-derived
-   offsets and bounds-checked copies, so a short or corrupt record is dropped
-   rather than misread.
+2. **Collector thread** — waits on both ring buffers with a bounded timeout
+   (one `poll(2)` on two fds), drains each batch, decodes every record with
+   `SchedSwitch::from_bytes` / `LifecycleRecord::from_bytes`, and pushes into
+   the two windows. Records are decoded with `offset_of!`-derived offsets and
+   bounds-checked copies, so a short or corrupt record is dropped rather than
+   misread.
 3. **Trigger-poller thread** — reads `/proc/pressure/{cpu,memory,io}` and the
    `oom_kill` counter in `/proc/vmstat` every `pressure.poll_interval_ms`, feeds
    a `PressureMonitor` (hysteresis) and an `OomMonitor` (discrete counter), and
@@ -108,3 +118,23 @@ header, so payload offsets are `prev_comm` 8, `prev_pid` 24, `prev_state` 32,
 `/sys/kernel/tracing/events/sched/sched_switch/format`. Reading the wrong offset
 is silent (wrong names, wrong pids), which is why the BPF crate documents the
 source of those numbers and they are checked in review.
+
+### Lifecycle wire format
+
+The same discipline applies to the second record, `Lifecycle`
+(`blackbox_core::lifecycle::LifecycleRecord`, also 64 bytes):
+
+- `sched_process_fork` — `parent_comm` 8, `parent_pid` 24, `child_comm` 28,
+  `child_pid` 44.
+- `sched_process_exec` — `filename` (a `__data_loc` whose low 16 bits are the
+  byte offset of the string inside the record) 8, `pid` 12, `old_pid` 16. The
+  string is read with `bpf_probe_read_kernel_str` at that dynamic offset and
+  capped to 15 characters; a bogus offset yields an empty name, never a dropped
+  event.
+- `sched_process_exit` — `comm` 8, `pid` 24, `prio` 28.
+
+These come from the same `…/events/sched/*/format` files and were verified
+against a real kernel; they have been stable kernel ABI for the lifetime of the
+tracepoints. A lifecycle record whose `kind` is unknown is dropped in userspace,
+and counted as malformed. Attaching the lifecycle tracepoints is best-effort:
+if a kernel lacks one, the daemon logs it and keeps collecting `sched_switch`.

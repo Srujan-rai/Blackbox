@@ -45,8 +45,22 @@ pub fn to_chrome_json_with(dump: &Dump, opts: ExportOptions) -> Result<String, s
     let mut events: Vec<Value> = Vec::with_capacity(kept.len() * 2 + 4);
 
     // Process-name metadata first, so tracks are labelled from the outset.
-    // Declared per unique pid: Chrome only accepts one per pid.
-    for (pid, comm) in unique_tasks(&kept) {
+    // Declared per unique pid: Chrome only accepts one per pid. Exec events
+    // also label their pid, since a brand-new binary may never appear as a
+    // sched slice (it ran on another CPU outside the window, or exited).
+    let mut task_meta = unique_tasks(&kept);
+    let mut declared: std::collections::HashSet<u32> =
+        task_meta.iter().map(|(pid, _)| *pid).collect();
+    for ev in &dump.lifecycle {
+        if ev.kind == crate::lifecycle::LifecycleKind::Exec
+            && !ev.comm.is_empty()
+            && declared.insert(ev.pid)
+        {
+            task_meta.push((ev.pid, ev.comm.clone()));
+        }
+    }
+    task_meta.sort_by_key(|(pid, _)| *pid);
+    for (pid, comm) in &task_meta {
         events.push(json!({
             "name": "process_name",
             "ph": "M",
@@ -67,6 +81,38 @@ pub fn to_chrome_json_with(dump: &Dump, opts: ExportOptions) -> Result<String, s
             "pid": s.pid,
             "tid": s.pid,
             "args": { "cpu": s.cpu, "comm": s.comm },
+        }));
+    }
+
+    // Lifecycle events become instant markers on their process's track, so a
+    // fork storm or a dying daemon is visible next to the scheduling picture.
+    for ev in &dump.lifecycle {
+        let (name, args) = match ev.kind {
+            crate::lifecycle::LifecycleKind::Fork => (
+                format!(
+                    "fork: {} (pid {}) -> {} (pid {})",
+                    ev.comm, ev.pid, ev.name, ev.peer_pid
+                ),
+                json!({ "child_pid": ev.peer_pid, "child_comm": ev.name }),
+            ),
+            crate::lifecycle::LifecycleKind::Exec => (
+                format!("exec: {}", ev.name),
+                json!({ "old_pid": ev.peer_pid, "path": ev.name }),
+            ),
+            crate::lifecycle::LifecycleKind::Exit => (
+                format!("exit: {} (pid {})", ev.comm, ev.pid),
+                json!({ "prio": ev.value }),
+            ),
+        };
+        events.push(json!({
+            "name": name,
+            "cat": "process",
+            "ph": "I",
+            "s": "t",
+            "ts": ns_to_us(ev.ts_ns.saturating_sub(base_ns)),
+            "pid": ev.pid,
+            "tid": ev.pid,
+            "args": args,
         }));
     }
 
@@ -154,6 +200,7 @@ mod tests {
             0,
             end,
             events,
+            Vec::new(),
             OverheadInfo::default(),
             crate::dump::HostSnapshot::default(),
             1_700_000_000_000_000_000,
@@ -304,6 +351,34 @@ mod tests {
         let v = parse(&to_chrome_json(&sample()).unwrap());
         assert_eq!(v["otherData"]["blackbox"]["slicesDroppedForSize"], 0);
         assert_eq!(v["otherData"]["blackbox"]["slicesEmitted"], 3);
+    }
+
+    #[test]
+    fn lifecycle_events_become_instant_markers() {
+        use crate::lifecycle::{LifecycleEvent, LifecycleKind};
+        let mut d = sample();
+        d.lifecycle = vec![LifecycleEvent {
+            ts_ns: NS,
+            kind: LifecycleKind::Exit,
+            pid: 9,
+            peer_pid: 0,
+            value: 120,
+            comm: "worker".into(),
+            name: String::new(),
+        }];
+        let v = parse(&to_chrome_json(&d).unwrap());
+        let instants: Vec<&Value> = v["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["ph"] == "I" && e["cat"] == "process")
+            .collect();
+        assert_eq!(instants.len(), 1);
+        let ev = instants[0];
+        assert!(ev["name"].as_str().unwrap().starts_with("exit: worker"));
+        assert_eq!(ev["pid"], 9);
+        assert_eq!(ev["ts"], 1_000_000);
+        assert_eq!(ev["args"]["prio"], 120);
     }
 
     #[test]

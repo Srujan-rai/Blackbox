@@ -9,8 +9,9 @@ history in userspace, and writes a self-describing trace the moment pressure
 crosses a threshold (or when you ask). The trace opens in
 [ui.perfetto.dev](https://ui.perfetto.dev/) or renders as a plain-text report.
 
-> **Status:** v0.1 — the MVP described in [Scope](#scope). The BPF program has
-> been loaded and verified end-to-end on a real kernel (see [Testing](#testing)).
+> **Status:** v0.2 — the MVP plus per-event export, OOM and lifecycle triggers.
+> The BPF program has been loaded and verified end-to-end on a real kernel (see
+> [Testing](#testing)).
 
 ---
 
@@ -22,14 +23,18 @@ CPU, who was holding it, what was stuck on I/O. By the time you attach `perf`,
 the moment is gone. Blackbox is always running, so the history is already
 there when the stall happens.
 
-It is deliberately small: one tracepoint, one ring buffer, one bounded window,
-a handful of triggers, and two export formats.
+It is deliberately small: a handful of tracepoints, two ring buffers, one
+bounded window, a handful of triggers, and two export formats.
 
 ## Features
 
 - **eBPF `sched_switch` capture** through a single tracepoint (no kprobes), via
   [aya](https://aya-rs.dev/) and CO-RE. One object runs across compatible
   kernels.
+- **Process lifecycle events** — `fork`, `exec` and `exit` are captured through
+  their own ring buffer (so the hot `sched_switch` path is untouched) and
+  appear in dumps, reports and the Perfetto export. For each `exec`, the
+  executed path is recorded (up to 15 characters, like a `comm`).
 - **Bounded history window** — the last *N* seconds capped by both an event
   count and a duration, so memory use is predictable (default 250k events /
   30s).
@@ -64,12 +69,14 @@ a handful of triggers, and two export formats.
 
 ## Scope
 
-**In (v0.1):** `sched_switch` only; PSI (CPU/memory/IO) + OOM + manual
-triggers; bounded history; native dump; text and Perfetto reports.
+**In (v0.2):** `sched_switch` + process lifecycle (fork/exec/exit); PSI
+(CPU/memory/IO) + OOM + manual triggers; bounded history; native dump (schema
+v2, and v1 traces still load); text and Perfetto reports.
 
-**Deliberately out (for now):** exec/exit/IO event sources, on-disk history
-across daemon restarts, a GUI, remote shipping. See
-[Limitations](#limitations) for the honest edges of what exists today.
+**Deliberately out (for now):** I/O event sources (block queue latency),
+cgroup/PID scoping or sampling, on-disk history across daemon restarts, a GUI,
+remote shipping. See [Limitations](#limitations) for the honest edges of what
+exists today.
 
 ## How it works
 
@@ -79,8 +86,11 @@ across daemon restarts, a GUI, remote shipping. See
 │ sched/sched_switch    │  8 MB          │  collector thread                  │
 │ tracepoint ──► 64-byte│  ringbuf ────► │   decode ──► HistoryRing           │
 │ record (no helper)    │                │              (last N s / max count)│
-└───────────────────────┘                │                                    │
-                                         │  trigger poller thread ─► trigger ┐  │
+│                       │                │                                    │
+│ sched_process_fork    │  512 KB        │   decode ──► LifecycleRing         │
+│ sched_process_exec    │  ringbuf ────► │   fork / exec / exit               │
+│ sched_process_exit    │                │                                    │
+└───────────────────────┘                │  trigger poller thread ─► trigger ┐  │
         /proc/pressure   ───────────────►│   hysteresis in PressureMonitor  │  │
         /proc/vmstat     ───────────────►│   oom_kill counter in OomMonitor ▼  │
                                          │  IPC thread (Unix socket) ──► write │
@@ -100,11 +110,15 @@ Two design decisions matter:
 2. **All the hard logic is in pure, testable Rust.** Interval reconstruction,
    ranking consumers, PSI hysteresis and report formatting live in
    `blackbox-core`, which runs without privileges. The BPF program only stamps
-   a CPU id and copies a fixed record into the ring buffer.
+   a CPU id and copies fixed records into the ring buffers — a 64-byte
+   `sched_switch` record and a 64-byte lifecycle record, each with its own
+   buffer so the scheduler hot path never branches on an event tag.
 
 On-CPU intervals are rebuilt per CPU from consecutive switches, using
 `prev_state` to separate *scheduler latency* (a runnable task lost the CPU —
 `prev_state == 0`) from *blocked time* (the task slept or waited on I/O).
+Lifecycle events ride in their own stream, so a fork storm or a respawning
+daemon is rendered as instant markers next to the scheduling picture.
 
 ## Overhead
 
@@ -113,11 +127,14 @@ the **machine-wide** context-switch rate, not with CPU load. Measured on an
 8-core host tracing a workload that does nothing but switch (400k switches per
 run):
 
-- the workload ran **~1.5×** slower (**+50–63 %**), i.e. **~1.5 µs added per
-  switch** the workload caused;
-- the daemon itself used **~0.6 of one core**;
+- the workload was slowed **+26–63 %** depending on the run — a noisy shared
+  host, so treat the range as indicative — i.e. **~0.6–1.7 µs added per switch**
+  the workload caused;
+- the daemon itself used **~0.6 of one core**, the stable figure across runs;
 - a **compute-bound** control was essentially untouched (blackbox runs no code
-  on compute).
+  on compute);
+- adding the lifecycle tracepoints (fork/exec/exit) in v0.2 changed none of
+  this: their cost is inside the run-to-run jitter.
 
 Writing that benchmark immediately found a real bug — a PSI poller that spun
 because a `continue` skipped its sleep — and fixing it cut daemon CPU from 1.6
@@ -295,17 +312,21 @@ here is a startup error), then `BLACKBOX_BPF_OBJECT`, then
 
 ## Dump format
 
-Dumps are native JSON with `schema_version: 1`. They are self-describing, so a
-trace from last week is still interpretable:
+Dumps are native JSON with `schema_version: 2` (v1 traces still load). They are
+self-describing, so a trace from last week is still interpretable:
 
 - `trigger` — `reason` (`manual`, `psi_cpu`, `psi_memory`, `psi_io`, `oom`) and
   a human `detail`.
 - `window` — monotonic and wall-clock endpoints, span, and `truncated` when a
   cap was hit.
 - `overhead` — `events_recorded`, `events_evicted` (our window's own
-  backpressure) and `events_dropped_kernel`.
+  backpressure), `events_dropped_kernel`, plus `lifecycle_recorded` and
+  `lifecycle_evicted` for the process stream.
 - `host` — hostname, kernel release, boot id, uptime.
 - `events` — the `sched_switch` records (monotonic ns timestamps).
+- `lifecycle` (new in schema 2) — the fork/exec/exit events, each with `kind`,
+  `pid`, `peer_pid`, optional `value` (exit priority), `comm` and `name`
+  (child comm on fork, the executed path on exec).
 
 `blackbox report` validates the schema and event ordering before rendering.
 Kernel-side ring-buffer drops are **not currently observable** through aya's
@@ -330,11 +351,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
 - **Least privilege.** Loading and attaching BPF is the only privileged act.
   The daemon can be run as root or with `CAP_BPF` + `CAP_PERFMON`; PSI reads
   and all report generation need no capabilities.
-- **Privacy.** Blackbox records only what the kernel puts in the `sched_switch`
-  tracepoint: the 15-character `comm`, PIDs, the previous task state, a
-  timestamp and a CPU id. It does **not** capture command lines, arguments,
-  environment variables, file paths or memory contents, so there is nothing
-  sensitive to redact by default.
+- **Privacy.** Blackbox records only what the kernel puts in the scheduler
+  tracepoints: the 15-character `comm` for switch/exit events, PIDs, the
+  previous task state, a timestamp and a CPU id. The process-lifecycle
+  tracepoints add a child's `comm` on `fork` and the **executed path** on
+  `exec` (up to 15 characters, e.g. `/usr/bin/psql`). It does **not** capture
+  command lines, arguments, environment variables or memory contents.
 - **No network.** The daemon neither listens on nor dials a network socket; it
   speaks line-delimited JSON over a local Unix socket, one request per
   connection.
@@ -350,22 +372,26 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
   `max_seconds` and `max_events`; at ~500k events/s, 250k events is only ~0.5s.
   Raise `max_events` (memory permitting) for a longer window on busy machines.
 - **Kernel drops read 0.** See above — not observable through aya today.
-- **`comm` only.** The kernel name (15 chars), not the full command line.
+- **`comm` only.** The kernel name (15 chars), not the full command line. `exec`
+  gets the executed path, but truncated to the same 15-character budget.
 - **Requires BTF** (`CONFIG_DEBUG_INFO_BTF`) for CO-RE.
-- **Single event source.** Only `sched_switch` in v0.1.
+- **Two event sources, not three.** `sched_switch` and process lifecycle are
+  captured; I/O event sources (block-queue issue/complete latency) are not, and
+  neither is cgroup/PID scoping or sampling — everything is captured
+  machine-wide, un-filtered.
 
 ## Testing
 
 ```sh
-cargo test --workspace            # 160 tests, no privileges needed
+cargo test --workspace            # 175 tests, no privileges needed
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite covers PSI parsing and hysteresis, the OOM `oom_kill` counter, on-CPU
-interval reconstruction, the bounded ring, config validation, dump schema
-validation, retention, the wire-record decoder, the IPC protocol and the
-text/Perfetto renderers.
+The suite covers PSI parsing and hysteresis, the OOM `oom_kill` counter, the
+lifecycle wire decoder and ring, on-CPU interval reconstruction, the bounded
+ring, config validation, dump schema validation (including v1 compatibility),
+retention, the IPC protocol and the text/Perfetto renderers.
 
 The BPF path is validated on a real kernel in privileged Docker:
 
@@ -393,7 +419,7 @@ sudo scripts/bench.sh   # baseline vs traced overhead on a switch hammer
 ## Repository layout
 
 ```
-crates/core     blackbox-core — pure analysis: events, history, PSI/OOM, dumps, reports
+crates/core     blackbox-core — pure analysis: events, history, lifecycle, PSI/OOM, dumps, reports
 crates/daemon   blackboxd — BPF collector, trigger poller, IPC server
 crates/cli      blackbox — start / status / dump / report
 crates/bench    blackbox-bench — dependency-free workload for the overhead benchmark

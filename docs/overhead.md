@@ -4,16 +4,20 @@ Blackbox is a tracer, so the fair question is not "is it free" — nothing that
 reads every context switch is free — but **what does it cost, and does that cost
 scale with the thing being traced?**
 
-This document is the answer for v0.1, measured with a harness you can run
-yourself ([`scripts/bench.sh`](../scripts/bench.sh)). The short version:
+This document is the answer for **v0.2** (with the process-lifecycle tracepoints
+attached), measured with a harness you can run yourself
+([`scripts/bench.sh`](../scripts/bench.sh)). The short version:
 
 - **Cost scales with the context-switch rate, not with CPU load.** Blackbox only
   runs on `sched_switch`, so a compute-bound workload is essentially untouched,
   while a workload that does nothing *but* switch is slowed proportionally to the
   per-event cost.
 - **The daemon used ≈ 0.6 of one core** while tracing a switch-heavy workload on
-  this 8-core host — about 2.5 µs of daemon CPU per event, or ~1.5 µs added
-  latency per switch seen by the workload.
+  this 8-core host — about 2.7 µs of daemon CPU per event ingested.
+- **The lifecycle tracepoints changed none of it**: adding fork/exec/exit moved
+  the daemon's CPU figure by noise (0.63 vs 0.60 core). They fire so rarely
+  compared to context switches that their whole cost fits in the run-to-run
+  jitter of this host.
 - The benchmark found and fixed a real bug (see
   [A bug this benchmark found](#a-bug-this-benchmark-found)).
 
@@ -55,35 +59,40 @@ each `cpu` rep is 200 million inner operations.
 
 ## Results
 
+Measured with `REPS=7`, `ROUNDS=200000` (each `switch` rep is 400 000 context
+switches). The host is shared, so percentage deltas swing from run to run; the
+range we have seen for `switch` across runs is **+26 % to +63 %**. The daemon-CPU
+figure is the stable one.
+
 ### `switch` — context-switch heavy (the case that matters)
 
 | | baseline | traced | change |
 |---|---|---|---|
-| best (min) | 991.70 ms | 1491.49 ms | **+50.4 %** |
-| median | 1091.05 ms | 1781.67 ms | **+63.3 %** |
+| best (min) | 790.01 ms | 1009.83 ms | **+27.8 %** |
+| median | 849.40 ms | 1069.55 ms | **+25.9 %** |
 
-Daemon CPU: **7520 ms over 12.62 s wall = 59.6 % of one core.**
+Daemon CPU: **4870 ms over 7.73 s wall = 63.0 % of one core.**
 
 Per switch: 400 000 switches per rep, so the added latency is
-`(1491.49 − 991.70) ms / 400 000 ≈ **1.25 µs/switch**` at best, `≈1.7 µs` at the
-median. The daemon's own CPU works out to `7520 ms / (7 × 400 000) ≈ **2.7 µs
-per event**`, including host events it also had to ingest.
+`(1009.83 − 790.01) ms / 400 000 ≈ **0.55 µs/switch**` on this run (earlier runs
+measured up to ~1.7 µs; see the note above about host contention). The daemon's
+own CPU works out to `4870 ms / (7 × 400 000) ≈ **1.7 µs per event**`, including
+host events it also had to ingest.
 
 ### `cpu` — compute-bound (control)
 
 | | baseline | traced | change |
 |---|---|---|---|
-| best (min) | 590.27 ms | 693.71 ms | +17.5 % |
-| median | 629.95 ms | 706.70 ms | +12.2 % |
+| best (min) | 591.72 ms | 602.46 ms | +1.8 % |
+| median | 598.83 ms | 610.13 ms | +1.9 % |
 
-Daemon CPU: **3170 ms over 5.09 s wall = 62.3 % of one core.**
+Daemon CPU: **2750 ms over 4.29 s wall = 64.1 % of one core.**
 
 Blackbox executes **nothing** on a pure compute loop, so a *clean* run should
-show ≈0 %. On this shared host the control still moved by double digits, which we
-attribute to **CPU contention** — the daemon is consuming ~0.6 core on a machine
-that is already busy — not to tracing the computation. It is a reminder that
-this host cannot produce clean microbenchmarks, and it is why the daemon's CPU
-figure is the number we trust most here.
+show ≈0 %. The small residual here is CPU contention — the daemon is consuming
+~0.6 core on a machine that is already busy. This host cannot produce clean
+microbenchmarks, which is why the daemon's CPU figure is the number we trust
+most.
 
 ### Before the fix (for contrast)
 
@@ -108,8 +117,8 @@ So instead of sampling `/proc/pressure` every 250 ms, the poller spun as fast as
 it could — re-reading pressure files and taking the shared runtime lock in a
 tight loop, contending with the collector. The fix is to let an empty `fired`
 fall through to the sleep (an empty `for` is a no-op). That single change cut
-daemon CPU from **1.6 cores to 0.6 cores** and the measured overhead from
-**+102 % to +50–63 %**.
+daemon CPU from **1.6 cores to 0.6 cores** and the measured overhead on
+`switch` from **+102 %** to the +26–63 % band seen since.
 
 This is exactly what an overhead benchmark is for, and it is why the harness
 ships in the repo rather than a one-off number in a blog post.
@@ -126,9 +135,10 @@ ships in the repo rather than a one-off number in a blog post.
 - **Tune the window, not the tracepoint.** The ingest cost is dominated by
   decoding and retaining events. Lower `[history].max_events` to shrink memory
   and the eviction churn; it does not reduce the per-event decode cost.
-- **v0.1 has no filtering.** There is no cgroup/PID scoping and no sampling yet
-  (see [Limitations](../README.md#limitations)); both are the obvious next
-  levers for high-switch hosts.
+- **v0.2 still has no filtering.** There is no cgroup/PID scoping and no sampling
+  yet (see [Limitations](../README.md#limitations)); both are the obvious next
+  levers for high-switch hosts. The lifecycle tracepoints added in v0.2 do not
+  change the picture: they fire so rarely that their cost is unmeasurable here.
 
 ## Reproduce it
 

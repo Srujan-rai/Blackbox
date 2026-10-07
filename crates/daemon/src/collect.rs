@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox_core::event::SchedSwitch;
+use blackbox_core::lifecycle::{LifecycleEvent, LifecycleRecord};
 use blackbox_core::oom;
 use blackbox_core::psi;
 use nix::errno::Errno;
@@ -71,7 +72,7 @@ const MAX_BATCH: usize = 4096;
 /// runtime — degraded mode, not a crash: status, manual dumps and PSI
 /// triggers keep working, and `blackbox status` carries the explanation.
 pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
-    let (_ebpf, mut ringbuf) = match load_and_attach(&object) {
+    let (_ebpf, mut ringbuf, mut lifecycle) = match load_and_attach(&object) {
         Ok(loaded) => loaded,
         Err(err) => {
             let reason = describe_failure(&err, &object);
@@ -87,20 +88,25 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
     );
 
     // `_ebpf` is bound (not the bare `_` pattern, which would drop it
-    // immediately): it owns the program's link, so it must live until this
+    // immediately): it owns the programs' links, so it must live until this
     // function returns. Dropping it at the end of the scope is what detaches
-    // the tracepoint — shutdown = detach.
+    // the tracepoints — shutdown = detach.
     let mut collected: u64 = 0;
+    let mut lifecycle_collected: u64 = 0;
     let mut malformed: u64 = 0;
+    let mut malformed_lifecycle: u64 = 0;
 
     while !stop_requested() {
         // Wait for data with a timeout so quiet systems still notice the stop
         // flag. aya's `RingBuf::next` is non-blocking with no blocking
-        // variant, so poll(2) on the ring buffer's fd is the wait.
-        // The `PollFd` is scoped: it borrows the ring buffer, and the drain
-        // below needs a mutable borrow, so the two must not coexist.
+        // variant, so poll(2) on the ring buffers' fds is the wait.
+        // The `PollFd`s are scoped: they borrow the ring buffers, and the
+        // drains below need mutable borrows, so the two must not coexist.
         let ready = {
-            let mut fds = [PollFd::new(ringbuf.as_fd(), PollFlags::POLLIN)];
+            let mut fds = [
+                PollFd::new(ringbuf.as_fd(), PollFlags::POLLIN),
+                PollFd::new(lifecycle.as_fd(), PollFlags::POLLIN),
+            ];
             poll(&mut fds, IDLE_POLL_MS)
         };
         match ready {
@@ -116,7 +122,7 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
         }
 
         // Decode into a local batch first, then lock once to push it. The
-        // lock is never held while reading the ring buffer, and never once
+        // lock is never held while reading a ring buffer, and never once
         // per event.
         let mut batch = Vec::with_capacity(1024);
         while batch.len() < MAX_BATCH {
@@ -130,7 +136,7 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
                         // cannot change mid-run, so the cause is a single
                         // stale object, not a stream of new problems.
                         eprintln!(
-                            "blackboxd: ring buffer record of unexpected size discarded — \
+                            "blackboxd: sched_switch record of unexpected size discarded — \
                              {} may be a stale build (further discards only counted)",
                             object.display()
                         );
@@ -138,18 +144,46 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
                 }
             }
         }
-        if batch.is_empty() {
+
+        // Lifecycle events are much rarer, so a smaller batch cap is plenty.
+        let mut lifecycle_batch: Vec<LifecycleEvent> = Vec::with_capacity(64);
+        while lifecycle_batch.len() < MAX_BATCH {
+            let Some(item) = lifecycle.next() else { break };
+            match LifecycleRecord::from_bytes(&item).and_then(|r| LifecycleEvent::from_record(&r)) {
+                Some(event) => lifecycle_batch.push(event),
+                None => {
+                    malformed_lifecycle += 1;
+                    if malformed_lifecycle == 1 {
+                        eprintln!(
+                            "blackboxd: lifecycle record of unexpected size or kind discarded — \
+                             {} may be a stale build (further discards only counted)",
+                            object.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        if batch.is_empty() && lifecycle_batch.is_empty() {
             continue;
         }
         collected += batch.len() as u64;
+        lifecycle_collected += lifecycle_batch.len() as u64;
         let mut rt = lock_runtime(&runtime);
         for event in batch {
             rt.history_mut().push(event);
         }
+        for event in lifecycle_batch {
+            rt.lifecycle_mut().push(event);
+        }
     }
 
-    // `ebpf` and `ringbuf` drop here: detach, then close.
-    eprintln!("blackboxd: collector stopped ({collected} events recorded, {malformed} malformed)");
+    // `ebpf` and the ring buffers drop here: detach, then close.
+    eprintln!(
+        "blackboxd: collector stopped ({collected} sched_switch and \
+         {lifecycle_collected} lifecycle events recorded, {} malformed)",
+        malformed + malformed_lifecycle
+    );
 }
 
 /// Poll `/proc/pressure` and `/proc/vmstat` on the configured interval and

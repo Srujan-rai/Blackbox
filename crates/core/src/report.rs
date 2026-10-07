@@ -44,6 +44,7 @@ pub fn render_report_with(dump: &Dump, opts: ReportOptions) -> String {
     top_consumers(&mut out, &slices, opts);
     longest_delays(&mut out, &gaps, opts);
     busiest_blocked(&mut out, &gaps, opts);
+    lifecycle_section(&mut out, dump, opts);
     if opts.per_cpu {
         per_cpu_table(&mut out, &slices, opts);
     }
@@ -112,6 +113,13 @@ fn integrity(out: &mut String, dump: &Dump, slices: &[OnCpuSlice]) {
             out,
             "history evicted",
             &dump.overhead.events_evicted.to_string(),
+        );
+    }
+    if dump.overhead.lifecycle_recorded > 0 {
+        kv(
+            out,
+            "lifecycle events",
+            &dump.overhead.lifecycle_recorded.to_string(),
         );
     }
     if dump.window.truncated {
@@ -219,6 +227,42 @@ fn per_cpu_table(out: &mut String, slices: &[OnCpuSlice], opts: ReportOptions) {
     out.push('\n');
 }
 
+/// The fork/exec/exit events in the window, most recent first.
+///
+/// Deliberately the last section: the numbers above it are the answer to "what
+/// was it doing?", while this is the answer to "what changed around the stall?".
+fn lifecycle_section(out: &mut String, dump: &Dump, opts: ReportOptions) {
+    if dump.lifecycle.is_empty() {
+        return;
+    }
+    rule(out, "process lifecycle");
+    out.push_str("  fork / exec / exit observed in the window (most recent first)\n");
+    let counts = dump
+        .lifecycle
+        .iter()
+        .fold((0usize, 0usize, 0usize), |acc, e| match e.kind {
+            crate::lifecycle::LifecycleKind::Fork => (acc.0 + 1, acc.1, acc.2),
+            crate::lifecycle::LifecycleKind::Exec => (acc.0, acc.1 + 1, acc.2),
+            crate::lifecycle::LifecycleKind::Exit => (acc.0, acc.1, acc.2 + 1),
+        });
+    kv(
+        out,
+        "counts",
+        &format!("{} fork, {} exec, {} exit", counts.0, counts.1, counts.2),
+    );
+    out.push('\n');
+    for event in dump.lifecycle.iter().rev().take(opts.top) {
+        out.push_str(&format!("  {}\n", event.describe()));
+    }
+    if dump.lifecycle.len() > opts.top {
+        out.push_str(&format!(
+            "  ... and {} earlier events\n",
+            dump.lifecycle.len() - opts.top
+        ));
+    }
+    out.push('\n');
+}
+
 fn rule(out: &mut String, title: &str) {
     out.push('\n');
     out.push_str(title);
@@ -230,7 +274,7 @@ fn rule(out: &mut String, title: &str) {
 }
 
 fn kv(out: &mut String, k: &str, v: &str) {
-    out.push_str(&format!("  {k:<16}{v}\n"));
+    out.push_str(&format!("  {k:<16} {v}\n"));
 }
 
 /// Human-readable duration, switching unit so the number stays short.
@@ -329,6 +373,7 @@ mod tests {
             0,
             end,
             events,
+            Vec::new(),
             OverheadInfo::default(),
             crate::dump::HostSnapshot::default(),
             1_700_000_000_000_000_000,
@@ -429,7 +474,10 @@ mod tests {
     #[test]
     fn a_clean_trace_states_zero_drops_explicitly() {
         let r = render_report(&sample());
-        assert!(r.contains("kernel drops    0") || r.contains("kernel drops    0\n"));
+        // Whitespace-insensitive: the key column spacing is presentation, not
+        // content.
+        let line = r.lines().find(|l| l.contains("kernel drops")).unwrap();
+        assert!(line.split_whitespace().last() == Some("0"), "got: {line}");
         assert!(!r.contains("WARNING"));
     }
 
@@ -524,6 +572,43 @@ mod tests {
             format_wall(1_583_020_800_000_000_000),
             "2020-03-01T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn lifecycle_events_render_in_their_own_section() {
+        use crate::lifecycle::{LifecycleEvent, LifecycleKind};
+        let mut d = sample();
+        d.lifecycle = vec![
+            LifecycleEvent {
+                ts_ns: NS,
+                kind: LifecycleKind::Exec,
+                pid: 42,
+                peer_pid: 41,
+                value: 0,
+                comm: "bash".into(),
+                name: "/usr/bin/psql".into(),
+            },
+            LifecycleEvent {
+                ts_ns: 2 * NS,
+                kind: LifecycleKind::Exit,
+                pid: 42,
+                peer_pid: 0,
+                value: 0,
+                comm: "psql".into(),
+                name: String::new(),
+            },
+        ];
+        d.overhead.lifecycle_recorded = 2;
+        let r = render_report(&d);
+        let sec = section(&r, "process lifecycle", "per-cpu");
+        assert!(sec.contains("1 exec, 1 exit"), "got:\n{sec}");
+        assert!(sec.contains("/usr/bin/psql"), "got:\n{sec}");
+        assert!(sec.contains("exit:  psql (pid 42"), "got:\n{sec}");
+    }
+
+    #[test]
+    fn lifecycle_section_is_absent_when_there_are_no_events() {
+        assert!(!render_report(&sample()).contains("process lifecycle"));
     }
 
     #[test]

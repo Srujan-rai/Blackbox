@@ -17,10 +17,15 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the meaning of an existing field changes.
 ///
 /// The event record is also a BPF wire struct, so changing its layout requires
-/// bumping this as well as rebuilding the BPF object.
-pub const SCHEMA_VERSION: u32 = 1;
+/// bumping this as well as rebuilding the BPF object. Version 2 added the
+/// `lifecycle` array (fork/exec/exit); version 1 dumps still load.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The oldest schema this build can still read.
+pub const MIN_SCHEMA_VERSION: u32 = 1;
 
 use crate::event::SchedSwitch;
+use crate::lifecycle::LifecycleEvent;
 
 /// A serialisable event, with comms as JSON strings rather than byte arrays.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,6 +96,12 @@ pub struct OverheadInfo {
     /// drain fast enough. This is the one that matters: it means the trace has
     /// holes and per-task totals may undercount.
     pub events_dropped_kernel: u64,
+    /// Lifecycle events (fork/exec/exit) currently retained. Added in schema 2.
+    #[serde(default)]
+    pub lifecycle_recorded: u64,
+    /// Lifecycle events dropped from the front because their window was full.
+    #[serde(default)]
+    pub lifecycle_evicted: u64,
 }
 
 impl OverheadInfo {
@@ -114,6 +125,12 @@ pub struct Dump {
     pub host: HostSnapshot,
     pub overhead: OverheadInfo,
     pub events: Vec<DumpEvent>,
+    /// Process lifecycle events (fork/exec/exit) in the same window.
+    ///
+    /// Added in schema version 2; absent in v1 dumps, where it defaults to
+    /// empty so old traces still load.
+    #[serde(default)]
+    pub lifecycle: Vec<LifecycleEvent>,
 }
 
 /// Host facts worth having next to every dump, since a trace without them is
@@ -170,14 +187,17 @@ impl Dump {
     /// Called on load so a corrupt or foreign file fails with a clear message
     /// instead of producing a plausible-looking but wrong report.
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version > SCHEMA_VERSION || self.schema_version < MIN_SCHEMA_VERSION {
             return Err(format!(
-                "unsupported schema_version {} (this build understands {SCHEMA_VERSION})",
-                self.schema_version
+                "unsupported schema_version {} (this build understands {}..={SCHEMA_VERSION})",
+                self.schema_version, MIN_SCHEMA_VERSION
             ));
         }
         if self.events.windows(2).any(|w| w[1].ts_ns < w[0].ts_ns) {
             return Err("events are not in chronological order".into());
+        }
+        if self.lifecycle.windows(2).any(|w| w[1].ts_ns < w[0].ts_ns) {
+            return Err("lifecycle events are not in chronological order".into());
         }
         Ok(())
     }
@@ -192,6 +212,7 @@ impl Dump {
         window_start_mono: u64,
         window_end_mono: u64,
         events: Vec<DumpEvent>,
+        lifecycle: Vec<LifecycleEvent>,
         overhead: OverheadInfo,
         host: HostSnapshot,
         generated_unix_ns: u64,
@@ -216,6 +237,7 @@ impl Dump {
             host,
             overhead,
             events,
+            lifecycle,
         }
     }
 }
@@ -251,10 +273,13 @@ mod tests {
                 ev(10_000_000_000, 0, 1, 2, 0),
                 ev(20_000_000_000, 0, 2, 1, 0),
             ],
+            Vec::new(),
             OverheadInfo {
                 events_recorded: 3,
                 events_evicted: 0,
                 events_dropped_kernel: 0,
+                lifecycle_recorded: 0,
+                lifecycle_evicted: 0,
             },
             HostSnapshot::default(),
             1_700_000_000_000_000_000,
@@ -307,6 +332,47 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_an_older_but_supported_schema() {
+        // Version 1 predates the lifecycle array; it must still load.
+        let mut d = dump();
+        d.schema_version = 1;
+        assert_eq!(d.validate(), Ok(()));
+    }
+
+    #[test]
+    fn lifecycle_events_appear_in_the_dump_and_stay_ordered() {
+        use crate::lifecycle::{LifecycleEvent, LifecycleKind};
+        let mut d = dump();
+        d.lifecycle = vec![
+            LifecycleEvent {
+                ts_ns: 5_000_000_000,
+                kind: LifecycleKind::Exec,
+                pid: 42,
+                peer_pid: 41,
+                value: 0,
+                comm: "bash".into(),
+                name: "/usr/bin/psql".into(),
+            },
+            LifecycleEvent {
+                ts_ns: 6_000_000_000,
+                kind: LifecycleKind::Exit,
+                pid: 42,
+                peer_pid: 0,
+                value: 0,
+                comm: "psql".into(),
+                name: String::new(),
+            },
+        ];
+        assert_eq!(d.validate(), Ok(()));
+        let text = serde_json::to_string_pretty(&d).unwrap();
+        let back: Dump = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.lifecycle, d.lifecycle);
+
+        d.lifecycle.swap(0, 1);
+        assert!(d.validate().unwrap_err().contains("lifecycle"));
+    }
+
+    #[test]
     fn validation_rejects_out_of_order_events() {
         let mut d = dump();
         d.events.swap(0, 2);
@@ -333,6 +399,7 @@ mod tests {
             events_recorded: 10,
             events_evicted: 100,
             events_dropped_kernel: 0,
+            ..Default::default()
         };
         assert!(!o.lossy(), "our own eviction does not make the trace lossy");
         o.events_dropped_kernel = 1;

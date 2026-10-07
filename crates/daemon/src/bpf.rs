@@ -7,13 +7,19 @@ use aya::{
 use aya_log::EbpfLogger;
 use std::path::Path;
 
-/// Load `blackbox-bpf.o` and attach its `sched_switch` tracepoint.
+/// Load `blackbox-bpf.o`, attach its tracepoints, and hand back both ring
+/// buffers.
 ///
-/// The returned `Ebpf` is not just a handle: it owns the program's link, so
-/// dropping it detaches the tracepoint. Callers must keep it alive for as
+/// `sched_switch` is required: without it there is no trace at all, so a
+/// failure there is a load failure. The three lifecycle tracepoints
+/// (fork/exec/exit) are best-effort — if a kernel lacks one, the daemon logs
+/// it and keeps collecting switches, because a partial trace beats none.
+///
+/// The returned `Ebpf` is not just a handle: it owns the programs' links, so
+/// dropping it detaches the tracepoints. Callers must keep it alive for as
 /// long as they want events (the collector thread holds it for its whole
 /// lifetime, which makes shutdown = detach).
-pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>)> {
+pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>, RingBuf<MapData>)> {
     let mut ebpf =
         aya::Ebpf::load_file(bpf_obj).with_context(|| format!("loading {}", bpf_obj.display()))?;
     // The aya-log reader is optional and must not fail the load. Our BPF
@@ -28,17 +34,38 @@ pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>)> {
         Err(aya_log::Error::MapNotFound) => {}
         Err(e) => eprintln!("blackboxd: aya-log reader failed to start: {e}"),
     }
-    let program: &mut TracePoint = ebpf
-        .program_mut("sched_switch")
-        .ok_or_else(|| anyhow!("program 'sched_switch' not found"))?
-        .try_into()?;
-    program.load()?;
-    program.attach("sched", "sched_switch")?;
+
+    attach_required(&mut ebpf, "sched_switch", "sched", "sched_switch")?;
+    for event in [
+        "sched_process_fork",
+        "sched_process_exec",
+        "sched_process_exit",
+    ] {
+        if let Err(err) = attach_required(&mut ebpf, event, "sched", event) {
+            eprintln!("blackboxd: lifecycle tracepoint {event} not available: {err:#}");
+        }
+    }
+
     let events_map = ebpf
         .take_map("EVENTS")
         .ok_or_else(|| anyhow!("map 'EVENTS' not found"))?;
     let ringbuf = RingBuf::try_from(events_map)?;
-    Ok((ebpf, ringbuf))
+    let lifecycle_map = ebpf
+        .take_map("LIFECYCLE")
+        .ok_or_else(|| anyhow!("map 'LIFECYCLE' not found"))?;
+    let lifecycle = RingBuf::try_from(lifecycle_map)?;
+    Ok((ebpf, ringbuf, lifecycle))
+}
+
+/// Look up a tracepoint program, load it and attach it to its event.
+fn attach_required(ebpf: &mut Ebpf, program: &str, category: &str, event: &str) -> Result<()> {
+    let prog: &mut TracePoint = ebpf
+        .program_mut(program)
+        .ok_or_else(|| anyhow!("program '{program}' not found"))?
+        .try_into()?;
+    prog.load()?;
+    prog.attach(category, event)?;
+    Ok(())
 }
 
 /// Turn a load/attach failure into an operator-facing explanation.

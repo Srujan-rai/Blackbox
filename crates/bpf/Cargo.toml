@@ -1,6 +1,6 @@
 [package]
 name = "blackbox-bpf"
-description = "BPF program for blackbox: observes sched_switch into a ring buffer"
+description = "BPF program for blackbox: observes sched_switch and process lifecycle into two ring buffers"
 version = "0.1.0"
 edition = "2021"
 publish = false

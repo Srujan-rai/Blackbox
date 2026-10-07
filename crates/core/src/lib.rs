@@ -15,6 +15,7 @@ pub mod event;
 pub mod history;
 pub mod hostinfo;
 pub mod ipc;
+pub mod lifecycle;
 pub mod oncpu;
 pub mod oom;
 pub mod perfetto;
@@ -29,6 +30,7 @@ pub use hostinfo::{collect, uptime_ns};
 pub use ipc::{
     default_socket_path, DumpResult, Request, Response, StatusInfo, DEFAULT_SOCKET_PATHS,
 };
+pub use lifecycle::{LifecycleEvent, LifecycleKind, LifecycleRecord, LifecycleRing};
 pub use oncpu::{gaps, reconstruct, OnCpuSlice, TaskGap};
 pub use oom::{OomFired, OomMonitor};
 pub use perfetto::to_chrome_json;

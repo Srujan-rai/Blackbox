@@ -1,6 +1,7 @@
 use blackbox_core::config::Config;
 use blackbox_core::dump::{Dump, DumpEvent, HostSnapshot, OverheadInfo, TriggerInfo};
 use blackbox_core::history::HistoryRing;
+use blackbox_core::lifecycle::LifecycleRing;
 use blackbox_core::oom::{OomFired, OomMonitor};
 use blackbox_core::psi::{PressureMonitor, PsiSnapshot, TriggerFired};
 use blackbox_core::{collect as collect_host, uptime_ns};
@@ -12,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug)]
 pub struct Runtime {
     history: HistoryRing,
+    lifecycle: LifecycleRing,
     monitor: PressureMonitor,
     oom: OomMonitor,
     config: Config,
@@ -29,8 +31,12 @@ impl Runtime {
         let proc_root = PathBuf::from("/proc");
         let host_snapshot = collect_host(&proc_root);
         let oom = OomMonitor::new(config.pressure.triggers.oom.enabled);
+        // Lifecycle events are far rarer than sched_switch, so the same caps
+        // are generous in practice while keeping the window identical.
+        let lifecycle = LifecycleRing::new(config.history.max_events, config.history.max_seconds);
         Self {
             history,
+            lifecycle,
             monitor,
             oom,
             config,
@@ -63,6 +69,14 @@ impl Runtime {
 
     pub fn history(&self) -> &HistoryRing {
         &self.history
+    }
+
+    pub fn lifecycle_mut(&mut self) -> &mut LifecycleRing {
+        &mut self.lifecycle
+    }
+
+    pub fn lifecycle(&self) -> &LifecycleRing {
+        &self.lifecycle
     }
 
     pub fn config(&self) -> &Config {
@@ -117,8 +131,23 @@ impl Runtime {
 
     pub fn build_dump(&self, trigger_reason: &str, trigger_detail: Option<&str>) -> Dump {
         let snapshot_events = self.history.snapshot();
-        let (start_mono, end_mono) = match (snapshot_events.first(), snapshot_events.last()) {
-            (Some(f), Some(l)) => (f.ts_ns, l.ts_ns),
+        let lifecycle_events = self.lifecycle.snapshot();
+        // The window spans both streams: a fork/exec/exit is part of the story
+        // even when the sched window is empty.
+        let earliest = snapshot_events
+            .first()
+            .map(|e| e.ts_ns)
+            .into_iter()
+            .chain(lifecycle_events.first().map(|e| e.ts_ns))
+            .min();
+        let latest = snapshot_events
+            .last()
+            .map(|e| e.ts_ns)
+            .into_iter()
+            .chain(lifecycle_events.last().map(|e| e.ts_ns))
+            .max();
+        let (start_mono, end_mono) = match (earliest, latest) {
+            (Some(f), Some(l)) => (f, l),
             _ => (0, 0),
         };
 
@@ -128,6 +157,8 @@ impl Runtime {
             events_recorded: dump_events.len() as u64,
             events_evicted: self.history.evicted(),
             events_dropped_kernel: self.kernel_drops,
+            lifecycle_recorded: lifecycle_events.len() as u64,
+            lifecycle_evicted: self.lifecycle.evicted(),
         };
 
         let now = SystemTime::now();
@@ -150,6 +181,7 @@ impl Runtime {
             start_mono,
             end_mono,
             dump_events,
+            lifecycle_events,
             overhead,
             self.host_snapshot.clone(),
             generated_unix_ns,
@@ -297,6 +329,68 @@ mod tests {
         };
         let history = HistoryRing::new(100, 30);
         Runtime::new(history, PressureMonitor::new(vec![]), config)
+    }
+
+    #[test]
+    fn lifecycle_events_flow_into_the_dump_and_overhead() {
+        use blackbox_core::lifecycle::{LifecycleEvent, LifecycleKind};
+        let dir = scratch("lifecycle");
+        let mut rt = runtime_in(&dir, None);
+        assert!(rt.lifecycle().is_empty());
+        rt.lifecycle_mut().push(LifecycleEvent {
+            ts_ns: 1_000,
+            kind: LifecycleKind::Exec,
+            pid: 77,
+            peer_pid: 76,
+            value: 0,
+            comm: "bash".into(),
+            name: "/usr/bin/git".into(),
+        });
+        let dump = rt.build_dump("manual", Some("requested"));
+        assert_eq!(dump.lifecycle.len(), 1);
+        assert_eq!(dump.lifecycle[0].pid, 77);
+        assert_eq!(dump.lifecycle[0].name, "/usr/bin/git");
+        assert_eq!(dump.overhead.lifecycle_recorded, 1);
+        // The lifecycle event widens the window even with no sched events.
+        assert_eq!(dump.window.span_ns, 0); // single event: span is 0, still bounded
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lifecycle_ring_caps_are_honoured_inside_the_runtime() {
+        use blackbox_core::lifecycle::{LifecycleEvent, LifecycleKind};
+        let dir = scratch("lifecycle-cap");
+        let config = Config {
+            dump: DumpConfig {
+                dir: dir.to_path_buf(),
+                keep_last: None,
+                timestamped_names: false,
+            },
+            history: blackbox_core::config::HistoryConfig {
+                max_events: 100,
+                max_seconds: 30,
+            },
+            ..Config::default()
+        };
+        let mut rt = Runtime::new(
+            HistoryRing::new(100, 30),
+            PressureMonitor::new(vec![]),
+            config,
+        );
+        for i in 0..200u32 {
+            rt.lifecycle_mut().push(LifecycleEvent {
+                ts_ns: i as u64,
+                kind: LifecycleKind::Exit,
+                pid: i,
+                peer_pid: 0,
+                value: 120,
+                comm: "x".into(),
+                name: String::new(),
+            });
+        }
+        assert!(rt.lifecycle().len() <= 100);
+        assert!(rt.lifecycle().evicted() >= 100);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -106,7 +106,7 @@ impl SchedSwitch {
 ///
 /// Bounds-checked via `get`, so a bad offset returns `None` instead of
 /// panicking inside the daemon's collector thread.
-fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+pub(crate) fn field<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..offset + N)?.try_into().ok()
 }
 
