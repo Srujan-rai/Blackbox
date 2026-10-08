@@ -69,7 +69,11 @@ blackbox report incident.json --perfetto > incident.perfetto.json
 The report's `process lifecycle` section lists fork/exec/exit events observed in
 the window (most recent first), with the executed path for `exec` events. Dumps
 of schema 2 include the `lifecycle` array; dumps written by an older build
-(schema 1) load fine and simply have no lifecycle events.
+(schema 1) load fine and simply have no lifecycle events. With
+`[bpf].filter_pids` set, the daemon only records lifecycle events whose subject
+is in the list (a fork matches on parent *or* child), and `blackbox status`
+prints `scope N pid(s)` so a filtered daemon cannot be mistaken for a
+machine-wide one.
 
 Open the Perfetto file by dragging it onto <https://ui.perfetto.dev/>.
 Lifecycle events appear there as instant markers on each process's track.
@@ -80,7 +84,7 @@ Lifecycle events appear there as instant markers on each process's track.
 |---|---|
 | `bpf_attached: false`, reason mentions privileges | Not root and missing `CAP_BPF`/`CAP_PERFMON`. |
 | `bpf_attached: false`, reason mentions the object | Object not found, or built for a different kernel/BTF. Rebuild with `./crates/bpf/build.sh release`. |
-| `bpf_attached: true`, `events retained 0` | Nothing is switching on the visible tasks, or the very first batch has not landed yet. |
+| `bpf_attached: true`, `events retained 0` | Nothing is switching on the visible tasks, or the very first batch has not landed yet. If `status` shows `scope N pid(s)`, only events involving those pids are retained — a quiet or absent process explains an empty window instantly. |
 | No lifecycle events in a dump | Expected when the window contains no forks/execs/exits; the section only renders when there is at least one. |
 | A lifecycle tracepoint is not attached | Extremely rare; the daemon logs which one and keeps collecting `sched_switch`. Check the daemon log. |
 | Window much shorter than `max_seconds` | `max_events` is the binding cap; raise it. |

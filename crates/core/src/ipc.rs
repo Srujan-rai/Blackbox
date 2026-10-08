@@ -43,6 +43,11 @@ pub struct StatusInfo {
     /// fields.
     #[serde(default)]
     pub bpf_error: Option<String>,
+    /// The pid filter applied at load, if any. Empty means machine-wide
+    /// tracing. `#[serde(default)]` so a new CLI parses a status reply from an
+    /// older daemon that does not have the field.
+    #[serde(default)]
+    pub filter_pids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,6 +92,7 @@ mod tests {
             config_path: "/etc/blackbox/config.toml".into(),
             bpf_attached: true,
             bpf_error: None,
+            filter_pids: vec![42, 43],
         });
         let text = serde_json::to_string(&resp).unwrap();
         match serde_json::from_str::<Response>(&text).unwrap() {
@@ -96,6 +102,7 @@ mod tests {
                 assert_eq!(s.last_trigger_reason.as_deref(), Some("manual"));
                 assert!(s.bpf_attached);
                 assert_eq!(s.bpf_error, None);
+                assert_eq!(s.filter_pids, vec![42, 43]);
             }
             other => panic!("expected status, got {other:?}"),
         }

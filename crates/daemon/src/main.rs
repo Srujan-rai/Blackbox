@@ -106,6 +106,7 @@ fn handle_client(
                 config_path: config_path.to_string(),
                 bpf_attached: rt.bpf_attached(),
                 bpf_error: rt.bpf_error().clone(),
+                filter_pids: rt.config().bpf.filter_pids.clone(),
             })
         }
         Request::Dump { output } => {

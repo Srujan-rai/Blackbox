@@ -194,6 +194,15 @@ fn print_status(info: StatusInfo) {
     // it under the ring buffer counters would hide exactly that.
     if info.bpf_attached {
         println!("bpf collection    attached");
+        if info.filter_pids.is_empty() {
+            println!("  scope           machine-wide (no pid filter)");
+        } else {
+            println!(
+                "  scope           {} pid(s): {:?}",
+                info.filter_pids.len(),
+                info.filter_pids
+            );
+        }
     } else {
         println!("bpf collection    NOT attached");
         match &info.bpf_error {

@@ -23,6 +23,8 @@
 #   ROUNDS    workload rounds per rep      (default: 200000)
 #   REPS      repetitions per phase        (default: 5)
 #   PIN_BENCH / PIN_DAEMON   CPU sets for the workload / daemon (needs taskset)
+#   FILTER_PIDS  comma-separated pids; exercises the [bpf] filter_pids knob
+#                (e.g. FILTER_PIDS=999999 to prove a filtered daemon is idle)
 #   KEEP      where to copy the traced dump (default: ./blackbox-bench-traced.json)
 set -euo pipefail
 
@@ -120,6 +122,13 @@ cat > "$WORK/config.toml" <<EOF
 dir = "$WORK/dumps"
 keep_last = 3
 EOF
+
+# Optional pid filter, appended when FILTER_PIDS is set — turns the traced
+# phase into a measurement of the filter's mitigation (see docs/overhead.md).
+if [ -n "${FILTER_PIDS:-}" ]; then
+  filter_array="$(echo "$FILTER_PIDS" | tr ',' ' ' | sed 's/ /, /g')"
+  printf '[bpf]\nfilter_pids = [%s]\n' "$filter_array" >> "$WORK/config.toml"
+fi
 
 if [ -n "$HAVE_TASKSET" ]; then
   taskset -c "$PIN_DAEMON" "$BLACKBOXD" --config "$WORK/config.toml" >"$WORK/daemon.log" 2>&1 &

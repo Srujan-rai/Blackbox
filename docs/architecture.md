@@ -138,3 +138,24 @@ against a real kernel; they have been stable kernel ABI for the lifetime of the
 tracepoints. A lifecycle record whose `kind` is unknown is dropped in userspace,
 and counted as malformed. Attaching the lifecycle tracepoints is best-effort:
 if a kernel lacks one, the daemon logs it and keeps collecting `sched_switch`.
+
+### The `FILTER` map
+
+Alongside `EVENTS` and `LIFECYCLE` the object defines `FILTER`, a plain 33-entry
+`BPF_MAP_TYPE_ARRAY` of `u32`. Slot 0 is the pid count (0 = trace everything,
+the default); slots 1–32 hold the configured pids (`[bpf].filter_pids`, capped
+at 32 by `MAX_FILTER_PIDS` in `blackbox-core`). Every program calls
+`passes_filter(pid, peer)`:
+
+- `sched_switch` passes `(prev_pid, next_pid)` — the event is kept when either
+  side of the switch is in the list;
+- fork passes `(parent_pid, child_pid)`; exec and exit pass `(pid, old_pid)` /
+  `(pid, 0)`.
+
+With an empty filter the lookup is one map read (slot 0 reads 0) and always
+passes. The daemon fills the map **before attaching any program** (via aya's
+borrowed `map_mut`, deliberately not `take_map` — a taken map is removed from
+the object, and a program loaded afterwards fails to resolve its reference), so
+there is no window in which an attached tracepoint emits unfiltered records. The
+map is written once at startup and never changed: the filter is fixed for the
+daemon's lifetime.

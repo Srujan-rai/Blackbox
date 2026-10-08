@@ -71,10 +71,11 @@ bounded window, a handful of triggers, and two export formats.
 
 **In (v0.2):** `sched_switch` + process lifecycle (fork/exec/exit); PSI
 (CPU/memory/IO) + OOM + manual triggers; bounded history; native dump (schema
-v2, and v1 traces still load); text and Perfetto reports.
+v2, and v1 traces still load); text and Perfetto reports; an optional PID
+filter that switches the daemon from machine-wide tracing to a few processes.
 
 **Deliberately out (for now):** I/O event sources (block queue latency),
-cgroup/PID scoping or sampling, on-disk history across daemon restarts, a GUI,
+cgroup scoping or sampling, on-disk history across daemon restarts, a GUI,
 remote shipping. See [Limitations](#limitations) for the honest edges of what
 exists today.
 
@@ -134,7 +135,11 @@ run):
 - a **compute-bound** control was essentially untouched (blackbox runs no code
   on compute);
 - adding the lifecycle tracepoints (fork/exec/exit) in v0.2 changed none of
-  this: their cost is inside the run-to-run jitter.
+  this: their cost is inside the run-to-run jitter;
+- a **PID filter** is the mitigation for high-switch hosts: filtering to a pid
+  that never appears dropped the daemon from 0.6 cores to **~0.15 % of one
+  core** and the measured workload cost to ~+1.5–4.7 % (the tracepoint itself
+  still fires — the filter removes the ingest, not the hook).
 
 Writing that benchmark immediately found a real bug — a PSI poller that spun
 because a `continue` skipped its sleep — and fixing it cut daemon CPU from 1.6
@@ -213,6 +218,7 @@ blackboxd status
   dump dir        /var/lib/blackbox/dumps
 
 bpf collection    attached
+  scope           machine-wide (no pid filter)
 
 ring buffer
   events retained 250000
@@ -298,6 +304,7 @@ timestamped_names = true
 
 [bpf]
 # object_path = "/usr/local/lib/blackbox/blackbox-bpf.o"
+# filter_pids = [1234, 5678]   # trace only these pids (max 32); empty = all
 ```
 
 `consecutive` is the hysteresis: N samples over threshold before firing. After
@@ -309,6 +316,14 @@ here is a startup error), then `BLACKBOX_BPF_OBJECT`, then
 `/usr/local/lib/blackbox/blackbox-bpf.o`, `/usr/lib/blackbox/blackbox-bpf.o`,
 `./blackbox-bpf.o`. If the search finds nothing, the daemon logs why, reports
 `bpf_attached: false` in `status`, and keeps serving.
+
+`[bpf].filter_pids` (a comma list of up to 32 pids; empty = every process) puts
+a pid filter into the kernel-side `FILTER` map at load time. A `sched_switch`
+record is only emitted when either side of the switch is in the list; a
+lifecycle event only when its subject is. The filter is fixed for the lifetime
+of the daemon (restart to change it) and the tracepoints still fire either
+way — what the filter removes is the ingest, decode and history cost, which is
+most of the daemon's CPU (see [Overhead](#overhead)).
 
 ## Dump format
 
@@ -376,14 +391,16 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
   gets the executed path, but truncated to the same 15-character budget.
 - **Requires BTF** (`CONFIG_DEBUG_INFO_BTF`) for CO-RE.
 - **Two event sources, not three.** `sched_switch` and process lifecycle are
-  captured; I/O event sources (block-queue issue/complete latency) are not, and
-  neither is cgroup/PID scoping or sampling — everything is captured
-  machine-wide, un-filtered.
+  captured; I/O event sources (block-queue issue/complete latency) are not.
+  Off by default the daemon traces machine-wide; the PID filter (`[bpf]
+  filter_pids`) narrows that to the listed processes — coarse (pids are not
+  stable across restarts) and not a substitute for cgroup scoping, which is
+  still absent.
 
 ## Testing
 
 ```sh
-cargo test --workspace            # 175 tests, no privileges needed
+cargo test --workspace            # 180 tests, no privileges needed
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

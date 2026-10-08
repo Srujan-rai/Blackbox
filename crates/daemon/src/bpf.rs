@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    maps::{MapData, RingBuf},
+    maps::{Array, MapData, RingBuf},
     programs::TracePoint,
     Ebpf,
 };
 use aya_log::EbpfLogger;
+use blackbox_core::config::MAX_FILTER_PIDS;
 use std::path::Path;
 
 /// Load `blackbox-bpf.o`, attach its tracepoints, and hand back both ring
@@ -15,11 +16,20 @@ use std::path::Path;
 /// (fork/exec/exit) are best-effort — if a kernel lacks one, the daemon logs
 /// it and keeps collecting switches, because a partial trace beats none.
 ///
+/// `filter_pids` populates the kernel-side `FILTER` map: a non-empty list
+/// narrows what is emitted to events involving those pids (see
+/// `blackbox_core::config::BpfConfig`). Longer lists are truncated at
+/// [`MAX_FILTER_PIDS`]; config validation has already rejected them, this is
+/// defence in depth.
+///
 /// The returned `Ebpf` is not just a handle: it owns the programs' links, so
 /// dropping it detaches the tracepoints. Callers must keep it alive for as
 /// long as they want events (the collector thread holds it for its whole
 /// lifetime, which makes shutdown = detach).
-pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>, RingBuf<MapData>)> {
+pub fn load_and_attach(
+    bpf_obj: &Path,
+    filter_pids: &[u32],
+) -> Result<(Ebpf, RingBuf<MapData>, RingBuf<MapData>)> {
     let mut ebpf =
         aya::Ebpf::load_file(bpf_obj).with_context(|| format!("loading {}", bpf_obj.display()))?;
     // The aya-log reader is optional and must not fail the load. Our BPF
@@ -34,6 +44,12 @@ pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>, RingBu
         Err(aya_log::Error::MapNotFound) => {}
         Err(e) => eprintln!("blackboxd: aya-log reader failed to start: {e}"),
     }
+
+    // Populate the pid filter BEFORE attaching anything: a tracepoint firing
+    // with an empty FILTER map (slot 0 == 0) emits every event. The window
+    // between attach and map-write would otherwise let a handful of unfiltered
+    // records into the trace.
+    configure_filter(&mut ebpf, filter_pids)?;
 
     attach_required(&mut ebpf, "sched_switch", "sched", "sched_switch")?;
     for event in [
@@ -55,6 +71,31 @@ pub fn load_and_attach(bpf_obj: &Path) -> Result<(Ebpf, RingBuf<MapData>, RingBu
         .ok_or_else(|| anyhow!("map 'LIFECYCLE' not found"))?;
     let lifecycle = RingBuf::try_from(lifecycle_map)?;
     Ok((ebpf, ringbuf, lifecycle))
+}
+
+/// Fill the kernel-side `FILTER` array from the config.
+///
+/// Slot 0 is the count (0 = no filtering); slots 1.. hold pids. The BPF
+/// programs read this on every event, so it is written once at startup and
+/// never touched again — there is deliberately no live-update path.
+///
+/// This deliberately uses `map_mut` (a borrow) rather than `take_map`:
+/// `take_map` removes the map from the object, so a program that is *loaded
+/// afterwards* fails to resolve its reference with "fd is not pointing to
+/// valid bpf_map". The map must stay owned by the object until every program
+/// is loaded; writing through a borrow keeps that guarantee. When the `Array`
+/// handle drops, the kernel map itself survives (owned by the loaded object).
+fn configure_filter(ebpf: &mut Ebpf, filter_pids: &[u32]) -> Result<()> {
+    let filter_map = ebpf
+        .map_mut("FILTER")
+        .ok_or_else(|| anyhow!("map 'FILTER' not found"))?;
+    let mut filter: Array<&mut MapData, u32> = filter_map.try_into()?;
+    let count = filter_pids.len().min(MAX_FILTER_PIDS) as u32;
+    filter.set(0, count, 0)?;
+    for (i, pid) in filter_pids.iter().take(MAX_FILTER_PIDS).enumerate() {
+        filter.set((i + 1) as u32, *pid, 0)?;
+    }
+    Ok(())
 }
 
 /// Look up a tracepoint program, load it and attach it to its event.

@@ -72,7 +72,10 @@ const MAX_BATCH: usize = 4096;
 /// runtime — degraded mode, not a crash: status, manual dumps and PSI
 /// triggers keep working, and `blackbox status` carries the explanation.
 pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
-    let (_ebpf, mut ringbuf, mut lifecycle) = match load_and_attach(&object) {
+    // The pid filter is fixed for the lifetime of the daemon; take it from the
+    // config once so the load sees a stable picture.
+    let filter_pids = lock_runtime(&runtime).config().bpf.filter_pids.clone();
+    let (_ebpf, mut ringbuf, mut lifecycle) = match load_and_attach(&object, &filter_pids) {
         Ok(loaded) => loaded,
         Err(err) => {
             let reason = describe_failure(&err, &object);
@@ -82,10 +85,19 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
         }
     };
     lock_runtime(&runtime).set_bpf_status(true, None);
-    eprintln!(
-        "blackboxd: collecting sched_switch events via {}",
-        object.display()
-    );
+    if filter_pids.is_empty() {
+        eprintln!(
+            "blackboxd: collecting sched_switch events via {}",
+            object.display()
+        );
+    } else {
+        eprintln!(
+            "blackboxd: collecting sched_switch and lifecycle events for {} pid(s) ({:?}) via {}",
+            filter_pids.len(),
+            filter_pids,
+            object.display()
+        );
+    }
 
     // `_ebpf` is bound (not the bare `_` pattern, which would drop it
     // immediately): it owns the programs' links, so it must live until this

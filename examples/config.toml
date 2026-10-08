@@ -38,3 +38,11 @@ timestamped_names = true
 # nothing is reported in `blackbox status` and the daemon runs without BPF
 # collection (manual dumps and PSI triggers still work).
 # object_path = "/usr/local/lib/blackbox/blackbox-bpf.o"
+
+# Optional pid filter (up to 32 pids, fixed for the daemon's lifetime).
+# Empty means trace every process machine-wide. When set, a sched_switch record
+# is kept only if one side of the switch is in the list, and a lifecycle event
+# only if its pid (parent/child for a fork) is. The tracepoints still fire —
+# the filter removes the ingest/decode/history cost, which is the bulk of the
+# daemon's CPU on a busy host (see docs/overhead.md).
+# filter_pids = []

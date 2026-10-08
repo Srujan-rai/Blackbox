@@ -27,7 +27,7 @@
 use aya_ebpf::helpers::gen::bpf_ktime_get_ns;
 use aya_ebpf::helpers::{bpf_get_current_comm, bpf_probe_read_kernel_str_bytes};
 use aya_ebpf::macros::{map, tracepoint};
-use aya_ebpf::maps::RingBuf;
+use aya_ebpf::maps::{Array, RingBuf};
 use aya_ebpf::programs::TracePointContext;
 use aya_ebpf::EbpfContext;
 
@@ -89,6 +89,48 @@ pub struct Lifecycle {
 
 const _: () = assert!(core::mem::size_of::<Lifecycle>() == 64);
 
+/// Optional PID filter, filled by the daemon from `[bpf].filter_pids`.
+///
+/// Layout: slot 0 holds the count (0 = trace everything, the default), slots
+/// 1..=FILTER_MAX hold up to 32 pids. When a filter is set, only events whose
+/// subject (prev/next for switches; pid/peer for lifecycle) appears in the list
+/// are emitted. The point is ingest reduction on high-switch hosts: the
+/// tracepoint still fires (it must, it has no choice), but the ring buffer,
+/// userspace decode and history window only see the pids you care about.
+const FILTER_MAX: usize = 32;
+
+#[map]
+static FILTER: Array<u32> = Array::with_max_entries((FILTER_MAX + 1) as u32, 0);
+
+/// True when the event should be traced under the configured filter.
+///
+/// With no filter (slot 0 == 0) this is a single array read and always true.
+/// With a filter it is a bounded linear scan: the loop runs over a constant
+/// range (`1..FILTER_MAX + 1`) so the verifier can prove termination, and
+/// breaks early once `count` is exhausted.
+fn passes_filter(pid: u32, peer: u32) -> bool {
+    let count = match FILTER.get(0) {
+        Some(c) => *c,
+        // The map is created by the load and never goes away; if it somehow
+        // fails to read, filter nothing rather than trace nothing.
+        None => return true,
+    };
+    if count == 0 {
+        return true;
+    }
+    for i in 1..(FILTER_MAX + 1) {
+        if (i as u32) > count {
+            break;
+        }
+        if let Some(slot) = FILTER.get(i as u32) {
+            if *slot == pid || *slot == peer {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[tracepoint]
 pub fn sched_switch(ctx: TracePointContext) -> u32 {
     // The context is the whole trace event record, common header included, so
@@ -129,6 +171,12 @@ pub fn sched_switch(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
+
+    // Apply the optional pid filter before doing any of the per-event work
+    // (timestamp, record build, output).
+    if !passes_filter(prev_pid, next_pid) {
+        return 0;
+    }
 
     let ev = SchedSwitch {
         ts_ns: unsafe { bpf_ktime_get_ns() },
@@ -204,6 +252,9 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
+    if !passes_filter(parent_pid, child_pid) {
+        return 0;
+    }
     emit_lifecycle(&Lifecycle {
         ts_ns: unsafe { bpf_ktime_get_ns() },
         value: 0,
@@ -241,6 +292,9 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
         Ok(c) => c,
         Err(_) => [0u8; 16],
     };
+    if !passes_filter(pid, old_pid) {
+        return 0;
+    }
     emit_lifecycle(&Lifecycle {
         ts_ns: unsafe { bpf_ktime_get_ns() },
         value: 0,
@@ -274,6 +328,9 @@ pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
+    if !passes_filter(pid, 0) {
+        return 0;
+    }
     emit_lifecycle(&Lifecycle {
         ts_ns: unsafe { bpf_ktime_get_ns() },
         value: prio as i64,

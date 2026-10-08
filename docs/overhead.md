@@ -135,10 +135,21 @@ ships in the repo rather than a one-off number in a blog post.
 - **Tune the window, not the tracepoint.** The ingest cost is dominated by
   decoding and retaining events. Lower `[history].max_events` to shrink memory
   and the eviction churn; it does not reduce the per-event decode cost.
-- **v0.2 still has no filtering.** There is no cgroup/PID scoping and no sampling
-  yet (see [Limitations](../README.md#limitations)); both are the obvious next
-  levers for high-switch hosts. The lifecycle tracepoints added in v0.2 do not
-  change the picture: they fire so rarely that their cost is unmeasurable here.
+- **The PID filter is the lever for high-switch hosts** (v0.2). The lifecycle
+  tracepoints added in v0.2 do not change the unfiltered picture — they fire so
+  rarely that their cost is unmeasurable here. What *does* change it is
+  `[bpf].filter_pids`:
+  - **Filtered to a pid that never appears, the daemon's CPU dropped from 63 %
+    of one core to 0.15 %**, and the measured workload cost from +26–41 % to
+    **+1.5–4.7 %** (same `switch` harness, `FILTER_PIDS=999999`).
+  - The residual is the tracepoint itself: it fires on every switch no matter
+    what, and blackbox's program adds one array-map read (slot 0) to each.
+    What the filter removes is the ring-buffer write, the userspace decode and
+    the history window — which is where the bulk of the daemon's CPU went.
+  - It is a **pid** filter: coarse, fixed at startup, and only useful when you
+    know which processes you care about. cgroup scoping and sampling remain the
+    obvious next levers and are still absent (see
+    [Limitations](../README.md#limitations)).
 
 ## Reproduce it
 
@@ -147,8 +158,10 @@ cargo build --release
 sudo scripts/bench.sh                       # 200k rounds, 5 reps per phase
 sudo ROUNDS=500000 REPS=7 scripts/bench.sh  # tighter
 sudo SCENARIO=cpu scripts/bench.sh          # the control
+sudo FILTER_PIDS=999999 scripts/bench.sh    # the filter mitigation
 ```
 
 `bench.sh` refuses to run if a `blackboxd` is already up, so the baseline is
 genuinely untraced. See the header of the script for every environment override
-(`BIN_DIR`, `REPS`, `ROUNDS`, `SCENARIO`, `PIN_BENCH`, `PIN_DAEMON`, …).
+(`BIN_DIR`, `REPS`, `ROUNDS`, `SCENARIO`, `PIN_BENCH`, `PIN_DAEMON`,
+`FILTER_PIDS`, …).

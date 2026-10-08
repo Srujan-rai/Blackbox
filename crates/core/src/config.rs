@@ -38,7 +38,8 @@ pub struct Config {
     pub bpf: BpfConfig,
 }
 
-/// Where to find the compiled BPF object (`blackbox-bpf.o`).
+/// Where to find the compiled BPF object (`blackbox-bpf.o`) and how to scope
+/// what it traces.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BpfConfig {
@@ -47,7 +48,19 @@ pub struct BpfConfig {
     /// fails startup (caught by [`Config::validate`]) rather than falling
     /// back — silently ignoring a typo would defeat the point of naming one.
     pub object_path: Option<PathBuf>,
+    /// Trace only these pids: a `sched_switch` record is kept when the pid on
+    /// either side of the switch is in the list; a lifecycle event is kept when
+    /// its subject (`pid`, or `parent_pid`/`child_pid` for a fork) is.
+    /// Empty (the default) traces everything machine-wide. The point is ingest
+    /// reduction on high-switch hosts — the tracepoint still fires, but the
+    /// ring buffer, decode and history only see the listed pids. Limited to
+    /// [`MAX_FILTER_PIDS`] entries; more are rejected at startup.
+    pub filter_pids: Vec<u32>,
 }
+
+/// How many pids `[bpf].filter_pids` may list. Mirrors `FILTER_MAX` in the BPF
+/// crate (each filter slot costs one array-map entry); keep the two in sync.
+pub const MAX_FILTER_PIDS: usize = 32;
 
 impl BpfConfig {
     /// Resolve which BPF object to load.
@@ -390,6 +403,12 @@ impl Config {
                 )));
             }
         }
+        if self.bpf.filter_pids.len() > MAX_FILTER_PIDS {
+            return Err(ConfigError::Invalid(format!(
+                "bpf.filter_pids lists {} pids; the filter is limited to {MAX_FILTER_PIDS}",
+                self.bpf.filter_pids.len()
+            )));
+        }
         Ok(())
     }
 
@@ -609,11 +628,51 @@ mod tests {
     }
 
     #[test]
+    fn filter_pids_parse_and_round_trip() {
+        let c = Config::from_toml("[bpf]\nfilter_pids = [100, 200, 300]\n").unwrap();
+        assert_eq!(c.bpf.filter_pids, vec![100, 200, 300]);
+        let back = Config::from_toml(&c.to_toml()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn filter_pids_absent_means_trace_everything() {
+        let c = Config::from_toml("[history]\nmax_seconds = 60\n").unwrap();
+        assert!(c.bpf.filter_pids.is_empty(), "default must be no filter");
+        assert_eq!(c.bpf, BpfConfig::default());
+    }
+
+    #[test]
+    fn filter_pids_at_the_limit_is_accepted_and_above_it_is_rejected() {
+        let ok = Config {
+            bpf: BpfConfig {
+                filter_pids: (1..=MAX_FILTER_PIDS as u32).collect(),
+                ..BpfConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(ok.validate().is_ok());
+        let too_many = Config {
+            bpf: BpfConfig {
+                filter_pids: (1..=MAX_FILTER_PIDS as u32 + 1).collect(),
+                ..BpfConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = too_many.validate().unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("{MAX_FILTER_PIDS}")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn explicit_object_path_that_exists_is_used_verbatim() {
         let path = scratch_object("explicit");
         let c = Config {
             bpf: BpfConfig {
                 object_path: Some(path.clone()),
+                ..BpfConfig::default()
             },
             ..Config::default()
         };
@@ -628,6 +687,7 @@ mod tests {
         let c = Config {
             bpf: BpfConfig {
                 object_path: Some(PathBuf::from("/nonexistent/blackbox-bpf.o")),
+                ..BpfConfig::default()
             },
             ..Config::default()
         };
