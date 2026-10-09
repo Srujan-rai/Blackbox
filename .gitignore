@@ -4,4 +4,5 @@
 *.o
 # Sample dumps produced by the daemon or the demo scripts.
 *.bbdump.json
-/examples/*.json
+/examples/*.json# Local presentation deck (kept out of the repo on purpose).
+/docs/presentation.html
