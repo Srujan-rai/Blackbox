@@ -4,25 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blackbox — a post-mortem recorder for the Linux scheduler</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e14'/%3E%3Cpath d='M8 9h16v4H8zm0 6h10v4H8zm0 6h16v4H8z' fill='%2322d3ee'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111'/%3E%3Cpath d='M6 24 L10 24 L14 12 L18 26 L21 16 L24 20 L26 20' fill='none' stroke='%23fff' stroke-width='2.4'/%3E%3C/svg%3E">
 <style>
   :root{
-    --bg0:#07090f; --bg1:#0a0e15; --panel:#0e141d; --card:#111a26;
-    --line:#1c2938; --line-soft:#15202d;
-    --ink:#e6edf3; --muted:#9fb0c3; --faint:#6b7c90;
-    --accent:#22d3ee; --accent-2:#a78bfa; --warn:#fbbf24; --danger:#fb7185; --ok:#34d399;
+    --bg:#ffffff; --panel:#f5f5f5; --card:#fbfbfb;
+    --line:#c9c9c9; --line-soft:#e4e4e4;
+    --ink:#111111; --muted:#555555; --faint:#8a8a8a;
+    --accent:#000000; --accent-2:#444444;
+    --grad: linear-gradient(90deg,#000000 0%, #555555 100%);
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    --grad: linear-gradient(100deg, #22d3ee 0%, #60a5fa 45%, #a78bfa 100%);
     --s: 1;
   }
   *{ box-sizing:border-box; margin:0; padding:0; }
   html,body{ height:100%; }
   body{
-    background:
-      radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,0.06), transparent 60%),
-      radial-gradient(1000px 500px at 0% 110%, rgba(167,139,250,0.05), transparent 60%),
-      var(--bg0);
+    background:#eaeaea;
     color:var(--ink);
     font-family:var(--sans);
     overflow:hidden;
@@ -37,37 +34,37 @@
   .topbar{
     display:flex; align-items:center; gap:14px;
     padding:10px 18px;
-    border-bottom:1px solid var(--line-soft);
-    background:linear-gradient(180deg, rgba(14,18,27,0.9), rgba(10,14,21,0.6));
-    backdrop-filter:blur(6px);
+    background:#ffffff;
+    border-bottom:1px solid var(--line);
     z-index:20;
   }
-  .logo{ display:flex; align-items:center; gap:10px; font-weight:650; letter-spacing:0.4px; font-size:14px; white-space:nowrap; }
-  .logo-b{ width:20px; height:20px; border-radius:5px; background:var(--grad); position:relative; }
-  .logo-b::after{ content:""; position:absolute; inset:5px; border-radius:2px; background:var(--bg0); }
+  .logo{ display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:0.4px; font-size:14px; white-space:nowrap; color:var(--ink); }
+  .logo-b{ width:20px; height:20px; border-radius:5px; background:var(--ink); position:relative; }
+  .logo-b::after{ content:""; position:absolute; inset:5px; border-radius:2px; background:#fff; }
+  .logo-b::before{ content:""; position:absolute; inset:0 5px; background:#fff; }
   .sub-tag{ color:var(--faint); font-size:11px; letter-spacing:1.5px; text-transform:uppercase; }
   .spacer{ flex:1; }
   .btn{
     display:inline-flex; align-items:center; gap:7px;
     font-size:12.5px; font-weight:600; letter-spacing:0.3px;
     color:var(--muted); padding:7px 12px; border-radius:8px;
-    border:1px solid var(--line-soft); transition:.15s;
+    border:1px solid var(--line); background:#fff; transition:.15s;
   }
-  .btn:hover{ color:var(--ink); border-color:var(--line); background:rgba(255,255,255,0.03); }
-  .btn.primary{ color:#06121a; background:var(--grad); border:none; }
-  .btn.primary:hover{ filter:brightness(1.08); }
+  .btn:hover{ color:var(--ink); border-color:var(--ink); background:#f4f4f4; }
+  .btn.primary{ color:#fff; background:#111; border:none; }
+  .btn.primary:hover{ background:#000; }
   .kbd{ font-family:var(--mono); font-size:10px; color:var(--faint); border:1px solid var(--line); border-radius:4px; padding:1px 5px; }
 
   /* ---------- stage & deck ---------- */
-  .stage{ position:relative; flex:1; overflow:hidden; }
+  .stage{ position:relative; flex:1; overflow:hidden; background:#dcdcdc; }
   .deck{ position:absolute; left:50%; top:50%; width:1280px; height:720px;
          transform:translate(-50%,-50%) scale(var(--s)); transform-origin:center center; }
   .slide{
     position:absolute; inset:0; opacity:0; visibility:hidden;
-    background:var(--bg1);
+    background:#ffffff;
     border:1px solid var(--line);
     border-radius:6px;
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.015);
+    box-shadow: 0 2px 18px rgba(0,0,0,0.14), 0 1px 3px rgba(0,0,0,0.08);
     padding:46px 56px 52px;
     display:flex; flex-direction:column;
     overflow:hidden;
@@ -77,12 +74,13 @@
 
   .kicker{
     font-family:var(--mono); font-size:12px; letter-spacing:2.5px; text-transform:uppercase;
-    color:var(--accent); margin-bottom:14px; display:flex; align-items:center; gap:10px;
+    color:var(--ink); margin-bottom:14px; display:flex; align-items:center; gap:10px;
+    font-weight:700;
   }
-  .kicker::before{ content:""; width:26px; height:2px; background:var(--grad); display:inline-block; }
-  h1.title{ font-size:38px; font-weight:720; letter-spacing:-0.5px; line-height:1.15; margin-bottom:10px; }
-  h2.subtitle{ font-size:19px; color:var(--muted); font-weight:450; line-height:1.45; }
-  .slide-body{ margin-top:18px; flex:1; display:flex; flex-direction:column; gap:16px; }
+  .kicker::before{ content:""; width:26px; height:3px; background:var(--ink); display:inline-block; }
+  h1.title{ font-size:34px; font-weight:750; letter-spacing:-0.5px; line-height:1.18; margin-bottom:10px; }
+  h2.subtitle{ font-size:18px; color:var(--muted); font-weight:450; line-height:1.45; }
+  .slide-body{ margin-top:14px; flex:1; display:flex; flex-direction:column; gap:16px; }
 
   .slide-footer{
     position:absolute; left:56px; right:56px; bottom:16px;
@@ -92,169 +90,135 @@
     border-top:1px solid var(--line-soft); padding-top:10px;
   }
 
+  /* wireframe accent word */
+  .emw{ -webkit-text-stroke:1.3px #111; color:transparent; font-weight:800; }
+
   /* generic content pieces */
   .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }
   .grid3{ display:grid; grid-template-columns:repeat(3,1fr); gap:20px; }
   .grid4{ display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
   .card{
-    background:linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.005));
-    border:1px solid var(--line-soft); border-radius:10px;
-    padding:20px 22px;
+    background:linear-gradient(180deg,#ffffff,#f7f7f7);
+    border:1px solid var(--line-soft);
+    border-top:2px solid var(--ink);
+    border-radius:10px;
+    padding:18px 20px;
   }
-  .card h3{ font-size:16px; font-weight:650; margin-bottom:8px; display:flex; align-items:center; gap:9px; }
-  .card p{ font-size:14.5px; line-height:1.55; color:var(--muted); }
-  .num{ font-family:var(--mono); font-size:12px; color:var(--accent-2); 
-        width:26px; height:26px; border:1px solid var(--line); border-radius:7px;
+  .card h3{ font-size:15px; font-weight:700; margin-bottom:8px; display:flex; align-items:center; gap:9px; color:var(--ink); }
+  .card p{ font-size:13.5px; line-height:1.55; color:var(--muted); }
+  .num{ font-family:var(--mono); font-size:12px; color:#fff; background:#111;
+        width:24px; height:24px; border-radius:6px;
         display:inline-flex; align-items:center; justify-content:center; flex:none; }
   ul.list{ list-style:none; display:flex; flex-direction:column; gap:11px; }
-  ul.list li{ font-size:16px; line-height:1.5; color:var(--ink); padding-left:26px; position:relative; }
-  ul.list li::before{ content:"▸"; position:absolute; left:0; color:var(--accent); }
+  ul.list li{ font-size:15.5px; line-height:1.5; color:var(--ink); padding-left:26px; position:relative; }
+  ul.list li::before{ content:"▸"; position:absolute; left:0; color:#000; font-weight:700; }
   ul.list li small, ul.list li .dim{ color:var(--faint); }
-  .lead{ font-size:17.5px; line-height:1.6; color:var(--muted); }
+  .lead{ font-size:16.5px; line-height:1.6; color:var(--muted); }
   .lead b, .lead strong{ color:var(--ink); font-weight:650; }
-  .hl{ color:var(--accent); }
-  .hl2{ color:var(--accent-2); }
-  .warn-c{ color:var(--warn); }
-  .ok-c{ color:var(--ok); }
+  .hl{ color:#000; font-weight:700; }
   .code{
-    font-family:var(--mono); font-size:13px; line-height:1.65; color:#d7e3ee;
-    background:#0a0f16; border:1px solid var(--line-soft); border-radius:10px;
+    font-family:var(--mono); font-size:13px; line-height:1.65; color:#1a1a1a;
+    background:#fafafa; border:1px solid var(--line-soft); border-radius:10px;
     padding:16px 18px; overflow:hidden; white-space:pre;
   }
-  .code .c{ color:var(--faint); } .code .k{ color:var(--accent-2); } .code .s{ color:var(--ok); }
-  .stat-row{ display:flex; gap:16px; flex-wrap:wrap; }
+  .code .c{ color:#999; } .code .k{ color:#000; font-weight:700; } .code .s{ color:#333; }
   .stat{
-    flex:1; min-width:180px; background:var(--card); border:1px solid var(--line-soft);
-    border-radius:10px; padding:18px 20px;
+    flex:1; min-width:180px; background:#fff; border:1px solid var(--line-soft); border-top:2px solid var(--ink);
+    border-radius:10px; padding:16px 20px;
   }
-  .stat .big{ font-size:34px; font-weight:750; font-family:var(--mono); letter-spacing:-1px; }
-  .stat .lbl{ font-size:12px; color:var(--faint); letter-spacing:1.2px; text-transform:uppercase; margin-top:6px; }
-  .stat .sub{ font-size:12.5px; color:var(--muted); margin-top:5px; line-height:1.5; }
+  .stat .big{ font-size:32px; font-weight:800; font-family:var(--mono); letter-spacing:-1px; color:#000; }
+  .stat .lbl{ font-size:11.5px; color:var(--faint); letter-spacing:1.2px; text-transform:uppercase; margin-top:6px; font-weight:600; }
+  .stat .sub{ font-size:12px; color:var(--muted); margin-top:5px; line-height:1.5; }
+  .stat-row{ display:flex; gap:16px; flex-wrap:wrap; }
 
-  /* architecture diagram */
-  .arch{ display:flex; flex-direction:column; gap:10px; font-size:13.5px; }
-  .arch-row{ display:flex; align-items:stretch; gap:10px; }
-  .arch-box{
-    flex:1; background:var(--card); border:1px solid var(--line); border-radius:8px;
-    padding:11px 14px;
-  }
-  .arch-box .be{ font-family:var(--mono); font-size:12px; color:var(--accent); letter-spacing:0.6px; }
-  .arch-box .de{ font-size:12px; color:var(--muted); margin-top:3px; line-height:1.4; }
-  .arch-box.hot{ border-color:rgba(34,211,238,0.5); }
-  .arch-box.usr{ border-color:rgba(167,139,250,0.45); }
-  .arrow{ display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--faint); font-size:11px; gap:2px; min-width:96px;}
-  .arrow .t{ font-family:var(--mono); font-size:10.5px; color:var(--faint); letter-spacing:0.8px;}
-  .arrow .i{ font-size:15px; color:var(--accent); }
+  .tag{ font-family:var(--mono); font-size:11px; color:#111; border:1.5px solid #111; border-radius:20px;
+        padding:3px 11px; letter-spacing:0.6px; font-weight:600; background:#fff; }
+  .tag.gray{ color:var(--faint); border-color:var(--line); background:transparent; font-weight:500; }
 
-  /* timeline (problem slide) */
-  .timeline{ display:flex; align-items:center; height:88px; position:relative;
-             background:linear-gradient(180deg, rgba(34,211,238,0.05), transparent);
-             border:1px solid var(--line-soft); border-radius:10px; padding:0 16px; }
-  .tl{ position:relative; height:8px; background:linear-gradient(90deg,#1a2938,#1a2938); border-radius:4px; flex:1; }
-  .tl .spark{ position:absolute; top:-11px; width:26px; height:26px; border-radius:50%;
-               background:rgba(251,191,36,0.16); border:2px solid var(--warn); }
-  .tl .boom{ position:absolute; top:-14px; width:34px; height:34px; border-radius:50%;
-             background:rgba(251,113,133,0.2); border:2px solid var(--danger); }
-  .tl .now{ position:absolute; top:-2px; width:3px; height:12px; background:var(--faint); }
-  .tl-label{ font-family:var(--mono); font-size:10.5px; color:var(--faint); letter-spacing:1px; position:absolute; }
-  .bracket{ position:absolute; left:6%; right:36%; top:-26px; height:6px; border:1px dashed var(--accent);
-            border-bottom:none; margin-top:-5px; }
-  .bracket-label{ position:absolute; left:6%; right:50%; top:-50px; font-size:11.5px; color:var(--accent);
-                  font-family:var(--mono); letter-spacing:1px; }
-
-  /* record strip (slide 5) */
-  .rec{ display:flex; margin-top:6px; }
-  .rec .f{ border-right:1px solid var(--line); padding:0 10px; text-align:center;
-            font-family:var(--mono); display:flex; flex-direction:column; justify-content:center;
-            background:linear-gradient(180deg, rgba(34,211,238,0.05), transparent); }
-  .rec .f:first-child{ border-radius:8px 0 0 8px; }
-  .rec .f:last-child{ border:none; border-radius:0 8px 8px 0; }
-  .rec .f .n{ font-size:11px; color:var(--accent); }
-  .rec .f .t{ font-size:11.5px; color:var(--ink); margin-top:4px; white-space:nowrap; }
-  .rec .f .o{ font-size:9.5px; color:var(--faint); margin-top:3px; font-family:var(--mono); }
-
-  /* trigger cards */
-  .trig{ display:flex; flex-direction:column; gap:13px; }
-  .trig .row{ display:flex; align-items:flex-start; gap:13px; }
-  .trig .ico{ width:34px; height:34px; border-radius:9px; display:flex; align-items:center; justify-content:center;
-              font-size:16px; flex:none; border:1px solid var(--line); background:var(--card); }
-  .trig .row b{ font-size:15.5px; }
-  .trig .row p{ font-size:13px; color:var(--muted); line-height:1.5; margin-top:3px; }
-  .tag{ font-family:var(--mono); font-size:10.5px; color:var(--accent); border:1px solid rgba(34,211,238,0.35);
-        background:rgba(34,211,238,0.07); border-radius:20px; padding:2px 9px; letter-spacing:0.5px; }
-  .tag.gray{ color:var(--muted); border-color:var(--line); background:transparent; }
-
-  .big-quote{ font-size:27px; font-weight:650; line-height:1.35; letter-spacing:-0.3px; }
-  .big-quote .em{ background:linear-gradient(100deg, var(--accent), var(--accent-2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
-
-  .banner{ display:flex; align-items:center; gap:12px; border:1px solid rgba(34,211,238,0.3);
-           background:rgba(34,211,238,0.06); border-radius:10px; padding:14px 18px; font-size:15.5px; }
-  .banner.amber{ border-color:rgba(251,191,36,0.4); background:rgba(251,191,36,0.07); }
-  .banner.red{ border-color:rgba(251,113,133,0.4); background:rgba(251,113,133,0.07); }
+  .big-quote{ font-size:22px; font-weight:650; line-height:1.4; letter-spacing:-0.3px; color:#111; }
+  .banner{ display:flex; align-items:center; gap:12px; border:1px solid var(--line-soft);
+           background:#f7f7f7; border-left:4px solid #111; border-radius:8px; padding:12px 16px; font-size:14.5px; }
+  .banner.amber{ border-left-color:#666; background:#fafafa; }
+  .banner.red{ border-left-color:#000; border-left-width:6px; background:#f2f2f2; }
+  .banner .ic{ font-size:16px; color:#111; }
 
   .center-wrap{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; }
+
+  /* title slide */
+  .t-chips{ display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  .mega{ font-size:98px; font-weight:800; letter-spacing:-2px; line-height:1; color:#111;
+         border-top:3px solid #111; border-bottom:3px solid #111; padding:6px 26px; }
+  .tagline{ font-size:20px; color:var(--muted); line-height:1.55; }
+  .chip{ display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--muted);
+         border:1px solid var(--line); border-radius:30px; padding:8px 16px; background:#fff; }
+  .chip b{ color:#111; }
+  .chip .ic{ font-weight:700; color:#111; }
+
+  /* charts & diagrams */
+  .graph-box{ background:#ffffff; border:1px solid var(--line-soft); border-radius:10px; padding:12px 14px; }
+  .graph-cap{ font-family:var(--mono); font-size:10.5px; letter-spacing:1.5px; text-transform:uppercase; color:var(--faint); margin-bottom:8px; }
 
   /* ---------- chrome overlays (presentation mode) ---------- */
   .deckbar{
     position:absolute; left:50%; bottom:14px; transform:translateX(-50%);
     display:flex; align-items:center; gap:12px;
-    background:rgba(7,9,15,0.82); border:1px solid var(--line); border-radius:12px;
-    padding:8px 14px; z-index:30; backdrop-filter:blur(8px);
+    background:#ffffff; border:1px solid var(--line); border-radius:12px;
+    box-shadow:0 4px 20px rgba(0,0,0,0.18);
+    padding:8px 14px; z-index:30;
     opacity:0; transition:opacity .25s; pointer-events:none;
   }
   .deckbar.show{ opacity:1; pointer-events:auto; }
   .deckbar .count{ font-family:var(--mono); font-size:12px; color:var(--muted); letter-spacing:1px; white-space:nowrap; }
   .navbtn{ width:30px; height:30px; border-radius:8px; border:1px solid var(--line);
            display:inline-flex; align-items:center; justify-content:center; font-size:14px; color:var(--muted);
-           transition:.15s; }
-  .navbtn:hover{ color:var(--ink); border-color:var(--accent); }
+           background:#fff; transition:.15s; }
+  .navbtn:hover{ color:#111; border-color:#111; }
 
   #progress{ position:fixed; left:0; bottom:0; height:3px; width:0%;
-             background:linear-gradient(90deg, var(--accent), var(--accent-2)); z-index:40; transition:width .25s; }
+             background:linear-gradient(90deg,#000,#888,#000); z-index:40; transition:width .25s; }
 
   /* ---------- grid / overview ---------- */
   #grid{
     position:fixed; inset:0; z-index:50;
-    background:var(--bg0); overflow:auto;
+    background:#f0f0f0; overflow:auto;
     display:none; padding:46px 40px 80px;
   }
   #grid.open{ display:block; }
   .grid-head{ display:flex; align-items:baseline; gap:14px; margin-bottom:26px; }
-  .grid-head h2{ font-size:22px; font-weight:700; letter-spacing:-0.3px; }
+  .grid-head h2{ font-size:22px; font-weight:750; letter-spacing:-0.3px; color:#111; }
   .grid-head span{ color:var(--faint); font-size:13px; }
   .grid-cards{ display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:24px; }
-  .tcard{ border-radius:12px; overflow:hidden; border:1px solid var(--line-soft); background:var(--bg1);
-          cursor:pointer; transition:.15s; position:relative; }
-  .tcard:hover{ border-color:var(--accent); transform:translateY(-2px); }
-  .tcard .view{ aspect-ratio:16/9; overflow:hidden; position:relative; background:#05070c; }
+  .tcard{ border-radius:12px; overflow:hidden; border:1px solid var(--line); background:#fff;
+          cursor:pointer; transition:.15s; position:relative; box-shadow:0 1px 4px rgba(0,0,0,0.08); }
+  .tcard:hover{ border-color:#111; transform:translateY(-2px); box-shadow:0 6px 18px rgba(0,0,0,0.12); }
+  .tcard .view{ aspect-ratio:16/9; overflow:hidden; position:relative; background:#fff; }
   .tcard .sub{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 12px; }
-  .tcard .sub .t{ font-size:12.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tcard .sub .t{ font-size:12.5px; font-weight:650; color:#111; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .tcard .sub .im{ font-family:var(--mono); font-size:11px; color:var(--faint); }
   .tcard .play{ position:absolute; right:8px; top:8px; width:32px; height:32px; border-radius:9px;
-                background:rgba(7,9,15,0.75); border:1px solid var(--line); color:var(--accent);
+                background:#fff; border:1px solid #111; color:#111;
                 font-size:14px; display:flex; align-items:center; justify-content:center; z-index:4;
                 opacity:0; transition:.15s; }
   .tcard:hover .play{ opacity:1; }
-  .tcard .play:hover{ border-color:var(--accent); background:var(--accent); color:#06121a; }
+  .tcard .play:hover{ background:#111; color:#fff; }
 
   /* help modal */
   #help{ position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
-         background:rgba(7,9,15,0.78); backdrop-filter:blur(4px); }
+         background:rgba(220,220,220,0.82); }
   #help.open{ display:flex; }
-  .help-box{ background:var(--bg1); border:1px solid var(--line); border-radius:14px; padding:28px 30px; width:560px; max-width:92vw; }
+  .help-box{ background:#fff; border:1px solid var(--line); border-radius:14px; padding:28px 30px; width:560px; max-width:92vw;
+             box-shadow:0 10px 40px rgba(0,0,0,0.2); }
   .help-box h3{ font-size:17px; margin-bottom:16px; }
   .help-grid{ display:grid; grid-template-columns:1fr 1fr; gap:8px 22px; }
   .help-grid .r{ display:flex; justify-content:space-between; align-items:center; font-size:13.5px; color:var(--muted); padding:5px 0; border-bottom:1px dashed var(--line-soft); }
-  .help-grid .r .k{ font-family:var(--mono); font-size:11px; color:var(--ink); border:1px solid var(--line); border-radius:5px; padding:2px 7px; }
+  .help-grid .r .k{ font-family:var(--mono); font-size:11px; color:#111; border:1px solid var(--line); border-radius:5px; padding:2px 7px; }
 
-  /* icons row on title slide */
-  .chip{ display:inline-flex; align-items:center; gap:8px; font-size:13.5px; color:var(--muted);
-         border:1px solid var(--line); border-radius:30px; padding:8px 16px; }
-  .chip b{ color:var(--ink); }
+  svg{ display:block; }
+  svg text{ font-family:var(--mono); }
 
-  #app:fullscreen{ background:#000; }
+  #app:fullscreen{ background:#fff; }
+  #app:fullscreen .topbar, #app:fullscreen .stage{ display:block; }
   #app:fullscreen .topbar{ display:none; }
-  #app:fullscreen .stage{ }
 
   @media (max-width: 900px){
     .topbar .sub-tag{ display:none; }
@@ -265,7 +229,7 @@
   }
   @media print{
     body{ overflow:visible; background:#fff; }
-    #app, .stage{ position:static; display:block; }
+    #app, .stage{ position:static; display:block; background:#fff; }
     .topbar, .deckbar, #progress, #grid, #help{ display:none !important; }
     .deck{ transform:none !important; position:static; width:100%; }
     .slide{ position:static; opacity:1; visibility:visible; page-break-after:always; }
@@ -274,6 +238,18 @@
 </head>
 <body>
 
+<!-- shared SVG defs (arrowheads + hatching used by every diagram) -->
+<svg width="0" height="0" style="position:absolute;overflow:hidden" aria-hidden="true">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#111"/>
+    </marker>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#8a8a8a" stroke-width="1.3"/>
+    </pattern>
+  </defs>
+</svg>
+
 <div id="app">
 
   <!-- top chrome -->
@@ -281,7 +257,7 @@
     <div class="logo">
       <span class="logo-b"></span>
       <span>Blackbox</span>
-      <span class="sub-tag">eBPF·Scheduler·Post-mortem</span>
+      <span class="sub-tag">eBPF · Scheduler · Post-mortem</span>
     </div>
     <div class="spacer"></div>
     <button class="btn" id="btn-grid">▦ &nbsp;All slides</button>
@@ -296,20 +272,25 @@
       <!-- ============ 1 · TITLE ============ -->
       <section class="slide" data-t="Blackbox: eBPF post-mortem recorder">
         <div class="center-wrap" style="gap:26px;">
-          <div style="display:flex; gap:10px; justify-content:center;">
+          <div class="t-chips">
             <span class="tag">RUST</span><span class="tag">eBPF / aya</span><span class="tag">CO-RE · BTF</span><span class="tag gray">LINUX ≥ 5.15</span>
           </div>
+          <svg viewBox="0 0 300 92" width="260" aria-label="heartbeat">
+            <rect x="8" y="6" width="284" height="80" rx="10" fill="#fff" stroke="#111" stroke-width="2"/>
+            <polyline points="18,46 60,46 78,22 98,72 116,34 132,46 188,46 206,16 226,70 244,36 260,46 282,46"
+                      fill="none" stroke="#111" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+            <line x1="8" y1="46" x2="18" y2="46" stroke="#111" stroke-width="2.6" />
+            <line x1="282" y1="46" x2="292" y2="46" stroke="#111" stroke-width="2.6" />
+          </svg>
           <div>
-            <div style="font-family:var(--mono); font-size:15px; letter-spacing:8px; color:var(--faint); text-transform:uppercase; margin-bottom:14px;">A post-mortem recorder for the Linux scheduler</div>
-            <div style="font-size:96px; font-weight:800; letter-spacing:-3px; line-height:1; background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent;">BLACKBOX</div>
-            <div style="font-size:21px; color:var(--muted); margin-top:22px; line-height:1.5;">
-              The half-second <b style="color:var(--ink);">before</b> a machine stalls —<br>captured always-on, explained one dump away.
-            </div>
+            <div style="font-family:var(--mono); font-size:14px; letter-spacing:7px; color:var(--faint); text-transform:uppercase; margin-bottom:16px; font-weight:600;">a post-mortem recorder for the linux scheduler</div>
+            <div class="mega">BLACKBOX</div>
+            <div class="tagline" style="margin-top:22px;">The half-second <b style="color:#111;">before</b> a machine stalls —<br>captured always-on, explained one dump away.</div>
           </div>
           <div style="display:flex; gap:12px; flex-wrap:wrap; justify-content:center;">
-            <span class="chip">⟲ <b>sched_switch</b> + lifecycle</span>
-            <span class="chip">⚠ <b>PSI</b> + OOM triggers</span>
-            <span class="chip">⇩ text + <b>Perfetto</b> reports</span>
+            <span class="chip"><span class="ic">◉</span> <b>sched_switch</b> + lifecycle</span>
+            <span class="chip"><span class="ic">∿</span> <b>PSI</b> + OOM triggers</span>
+            <span class="chip"><span class="ic">▤</span> text + <b>Perfetto</b> reports</span>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox · v0.2</span><span>1</span></div>
@@ -318,41 +299,54 @@
       <!-- ============ 2 · PROBLEM ============ -->
       <section class="slide" data-t="The problem: the moment is gone">
         <div class="kicker">Why</div>
-        <h1 class="title">The interesting part happens <span class="em" style="background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent;">before you notice</span></h1>
+        <h1 class="title">The interesting part happens <span class="emw">before you notice</span></h1>
         <div class="slide-body">
-          <div class="grid2" style="flex:1;">
-            <div style="display:flex; flex-direction:column; gap:18px; justify-content:center;">
-              <div class="big-quote" style="font-size:22px; line-height:1.5;">When a machine stalls, the question is: <span class="em">“which tasks were runnable and couldn’t get a CPU?”</span></div>
-              <ul class="list" style="font-size:15.5px;">
+          <div class="grid2" style="flex:1; align-items:stretch;">
+            <div style="display:flex; flex-direction:column; gap:16px; justify-content:center;">
+              <div class="big-quote">When a machine stalls, the question is: <span class="emw">“which tasks were runnable and couldn’t get a CPU?”</span></div>
+              <ul class="list" style="font-size:14.5px;">
                 <li>By the time you attach <code>perf</code>, the window you needed has <b>already slid past</b>.</li>
                 <li>Who was holding the CPU? What was stuck on I/O? <b>Unanswerable after the fact.</b></li>
                 <li>Servers go through seconds of complete unresponsiveness — and nobody kept the tape.</li>
               </ul>
-              <div class="banner" style="margin-top:4px;">
-                <span style="font-size:18px;">🎯</span>
+              <div class="banner">
+                <span class="ic">●</span>
                 <span><b>Blackbox is always running</b>, so the history is already there when the stall happens.</span>
               </div>
             </div>
-            <div style="display:flex; flex-direction:column; gap:28px; justify-content:center;">
-              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase;">What today looks like</div>
-              <div class="timeline">
-                <div class="bracket"></div>
-                <span class="bracket-label">the half-second that matters — already gone</span>
-                <div class="tl">
-                  <span class="tl-label" style="left:2%; bottom:-22px;">normal</span>
-                  <span class="tl-label" style="left:48%; bottom:-22px;">spike</span>
-                  <span class="spark" style="left:55%;"></span>
-                  <span class="tl-label" style="left:74%; top:-20px; color:var(--danger);">stall</span>
-                  <span class="boom" style="left:78%;"></span>
-                  <span class="now" style="left:92%;"></span>
-                </div>
+            <div style="display:flex; flex-direction:column; gap:14px; justify-content:center;">
+              <div class="graph-box">
+                <div class="graph-cap">what today looks like</div>
+                <svg viewBox="0 0 520 250" width="100%">
+                  <line x1="30" y1="140" x2="490" y2="140" stroke="#333" stroke-width="1.5"/>
+                  <!-- normal zone -->
+                  <rect x="30" y="140" width="220" height="26" fill="#f2f2f2" stroke="#bbb" stroke-width="1"/>
+                  <!-- spike bump -->
+                  <polygon points="252,140 294,102 336,140" fill="#e6e6e6" stroke="#999" stroke-width="1.2"/>
+                  <!-- stall block -->
+                  <rect x="360" y="140" width="90" height="26" fill="#111"/>
+                  <!-- now tick -->
+                  <line x1="478" y1="132" x2="478" y2="176" stroke="#666" stroke-width="3"/>
+                  <!-- bracket over the region that matters -->
+                  <path d="M30 84 H340" stroke="#111" stroke-width="1.5"/>
+                  <path d="M30 78 V90" stroke="#111" stroke-width="1.5"/>
+                  <path d="M340 78 V90" stroke="#111" stroke-width="1.5"/>
+                  <text x="185" y="66" text-anchor="middle" font-size="11" fill="#666" letter-spacing="0.5">the half-second that matters — already gone</text>
+                  <text x="405" y="128" text-anchor="middle" font-size="10" fill="#444">you notice here</text>
+                  <text x="140" y="186" text-anchor="middle" font-size="11" fill="#888">normal</text>
+                  <text x="294" y="186" text-anchor="middle" font-size="11" fill="#888">spike</text>
+                  <text x="405" y="186" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">stall</text>
+                  <text x="478" y="186" text-anchor="middle" font-size="11" fill="#666">now</text>
+                </svg>
               </div>
-              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase;">What blackbox keeps</div>
-              <div class="code" style="font-size:12.5px;"><span class="c"># last 30 s / 250k events, always on</span>
+              <div class="graph-box">
+                <div class="graph-cap">what blackbox keeps</div>
+                <div class="code" style="font-size:12px; margin:0;"><span class="c"># last 30 s / 250k events, always on</span>
 <span class="k">$</span> blackbox dump -o incident.json
 <span class="k">$</span> blackbox report incident.json
-top cpu consumers:  swapper/3 63.7% · bpf-collector 6.4% …
+top cpu consumers:  swapper/3 63.7% …
 longest sched delay: 2.0 ms — <span class="s">reproduced after the fact</span></div>
+              </div>
             </div>
           </div>
         </div>
@@ -366,59 +360,142 @@ longest sched delay: 2.0 ms — <span class="s">reproduced after the fact</span>
         <div class="slide-body">
           <p class="lead">Four moves, nothing more — and each one is deliberately small.</p>
           <div class="grid4">
-            <div class="card"><h3><span class="num">1</span>Capture</h3><p>Watches <b>sched_switch</b> through one tracepoint (no kprobes), plus <b>fork / exec / exit</b> lifecycle events on their own stream.</p></div>
+            <div class="card"><h3><span class="num">1</span>Capture</h3><p>Watches <b>sched_switch</b> through one tracepoint (no kprobes), plus <b>fork / exec / exit</b> lifecycle on their own stream.</p></div>
             <div class="card"><h3><span class="num">2</span>Retain</h3><p>Keeps a rolling <b>last-N window</b> in userspace — capped by both event count and seconds, so memory is predictable.</p></div>
             <div class="card"><h3><span class="num">3</span>Trigger</h3><p>Writes a trace the moment <b>PSI pressure</b> (CPU / memory / I/O) or an <b>OOM kill</b> crosses a threshold — or when you ask.</p></div>
             <div class="card"><h3><span class="num">4</span>Export</h3><p>One self-describing JSON dump → <b>plain-text report</b> or a <b>Perfetto</b> timeline you drag into ui.perfetto.dev.</p></div>
           </div>
-          <div class="banner" style="margin-top:6px;">
-            <span style="font-size:18px;">🧠</span>
+          <div class="banner">
+            <span class="ic">◇</span>
             <span>All of the hard logic — intervals, ranking, hysteresis — is <b>pure user-space Rust</b>. The BPF side only stamps and copies 64-byte records.</span>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>3</span></div>
       </section>
 
-      <!-- ============ 4 · ARCHITECTURE ============ -->
-      <section class="slide" data-t="How it works">
-        <div class="kicker">How it works</div>
-        <h1 class="title">Kernel stamps, userspace thinks</h1>
+      <!-- ============ 4 · HOW IT HELPS ============ -->
+      <section class="slide" data-t="How it helps">
+        <div class="kicker">Value</div>
+        <h1 class="title">What it’s for — and why it helps</h1>
         <div class="slide-body">
-          <div class="arch">
-            <div class="arch-row">
-              <div class="arch-box hot"><div class="be">sched/sched_switch · tracepoint</div><div class="de">no kprobe · adds cpu id · copies 64 B</div></div>
-              <div class="arrow"><span class="t">8 MB ring</span><span class="i">→</span></div>
-              <div class="arch-box hot"><div class="be">EVENTS ringbuf</div><div class="de">64-byte records · never tags branches</div></div>
-              <div class="arrow"><span class="t">decode</span><span class="i">→</span></div>
-              <div class="arch-box usr"><div class="be">HistoryRing (userspace)</div><div class="de">bounded VecDeque · last N s / count</div></div>
-            </div>
-            <div class="arch-row">
-              <div class="arch-box hot"><div class="be">sched_process_ fork · exec · exit</div><div class="de">best-effort attach · their own stream</div></div>
-              <div class="arrow"><span class="t">512 KB</span><span class="i">→</span></div>
-              <div class="arch-box hot"><div class="be">LIFECYCLE ringbuf</div><div class="de">fork / exec / exit · exec path ≤15 chars</div></div>
-              <div class="arrow"><span class="t">decode</span><span class="i">→</span></div>
-              <div class="arch-box usr"><div class="be">LifecycleRing</div><div class="de">instant markers alongside the trace</div></div>
-            </div>
-            <div class="arch-row">
-              <div class="arch-box"><div class="be">/proc/pressure · /proc/vmstat</div><div class="de">polled every 250 ms · zero BPF</div></div>
-              <div class="arrow"><span class="t">hysteresis</span><span class="i">→</span></div>
-              <div class="arch-box usr"><div class="be">Trigger poller → PressureMonitor / OomMonitor</div><div class="de">fires once, re-arms when pressure recedes</div></div>
-              <div class="arrow"><span class="t">fire</span><span class="i">→</span></div>
-              <div class="arch-box usr"><div class="be">Dump writer</div><div class="de">JSON schema v2 · host meta · window bounds</div></div>
-            </div>
-            <div class="arch-row">
-              <div class="arch-box"><div class="be">blackbox CLI · start / status / dump</div><div class="de">Unix socket · status · manual dump · retention</div></div>
-              <div class="arrow"><span class="t">IPC</span><span class="i">→</span></div>
-              <div class="arch-box usr"><div class="be">blackboxd · 3 threads, one locked Runtime</div><div class="de">collect · trigger-poll · IPC — shared state</div></div>
-              <div class="arrow"><span class="t">report</span><span class="i">→</span></div>
-              <div class="arch-box usr"><div class="be">Text report / Perfetto JSON</div><div class="de">offline · no privileges needed</div></div>
-            </div>
+          <div class="graph-box">
+            <div class="graph-cap">the difference it makes</div>
+            <svg viewBox="0 0 1160 150" width="100%">
+              <!-- without -->
+              <rect x="20" y="16" width="380" height="118" rx="10" fill="#fafafa" stroke="#bbb" stroke-width="1.2"/>
+              <text x="40" y="40" font-size="12" font-weight="700" fill="#444">without blackbox</text>
+              <text x="40" y="64" font-size="12" fill="#777">✕  we notice a stall</text>
+              <text x="40" y="84" font-size="12" fill="#777">✕  attach perftool…</text>
+              <text x="40" y="104" font-size="12" fill="#777">✕  window already gone → guess</text>
+              <!-- arrow -->
+              <line x1="424" y1="75" x2="472" y2="75" stroke="#111" stroke-width="2.5" marker-end="url(#arr)"/>
+              <!-- with -->
+              <rect x="492" y="16" width="380" height="118" rx="10" fill="#fafafa" stroke="#111" stroke-width="1.5"/>
+              <text x="512" y="40" font-size="12" font-weight="700" fill="#111">with blackbox</text>
+              <text x="512" y="64" font-size="12" fill="#333">●  always-on recording</text>
+              <text x="512" y="84" font-size="12" fill="#333">●  dump written automatically at the stall</text>
+              <text x="512" y="104" font-size="12" fill="#333">●  replay the half-second → answer</text>
+              <!-- verdict disk -->
+              <circle cx="1010" cy="75" r="46" fill="#111"/>
+              <text x="1010" y="70" text-anchor="middle" font-size="13" font-weight="700" fill="#fff">answer</text>
+              <text x="1010" y="90" text-anchor="middle" font-size="13" font-weight="700" fill="#fff">in seconds</text>
+              <path d="M1010 121 V132" stroke="#111" stroke-width="2"/>
+              <path d="M964 121 H1056" stroke="#111" stroke-width="2"/>
+            </svg>
+          </div>
+          <div class="grid4">
+            <div class="card"><h3>▣ Incident response</h3><p>“What happened at 02:14?” → <b>replay the trace</b> instead of arguing from logs.</p></div>
+            <div class="card"><h3>▣ Noisy neighbours</h3><p>“Who stole the CPU?” → per-task on-CPU intervals + longest scheduler delays.</p></div>
+            <div class="card"><h3>▣ Batch &amp; CI fleets</h3><p>“Why did this job stall?” → a reproducible dump, not a flaky log tail.</p></div>
+            <div class="card"><h3>▣ App performance</h3><p>“Stuck or starved?” → <code>prev_state</code> separates blocked time from ready-but-no-CPU.</p></div>
+          </div>
+          <div class="banner">
+            <span class="ic">◉</span>
+            <span><b>Use it as a tripwire:</b> leave it running, and when something bad happens the evidence already exists — cheap enough (~0.6 of one core, machine-wide) to default on.</span>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>4</span></div>
       </section>
 
-      <!-- ============ 5 · BPF HALF ============ -->
+      <!-- ============ 5 · ARCHITECTURE ============ -->
+      <section class="slide" data-t="How it works">
+        <div class="kicker">How it works</div>
+        <h1 class="title">Kernel stamps, userspace thinks</h1>
+        <div class="slide-body">
+          <svg viewBox="0 0 1160 430" width="100%">
+            <!-- kernel column -->
+            <text x="129" y="12" font-size="10" letter-spacing="1.5" fill="#888">KERNEL SIDE</text>
+            <rect x="14" y="16" width="230" height="86" rx="8" fill="#fff" stroke="#111" stroke-width="1.4"/>
+            <text x="129" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="#111">sched_switch</text>
+            <text x="129" y="66" text-anchor="middle" font-size="11" fill="#666">tracepoint · no kprobe</text>
+            <text x="129" y="84" text-anchor="middle" font-size="11" fill="#888">stamps cpu id · copies 64 B</text>
+
+            <rect x="14" y="118" width="230" height="86" rx="8" fill="#fff" stroke="#111" stroke-width="1.4"/>
+            <text x="129" y="146" text-anchor="middle" font-size="13" font-weight="700" fill="#111">fork · exec · exit</text>
+            <text x="129" y="168" text-anchor="middle" font-size="11" fill="#666">lifecycle tracepoints</text>
+            <text x="129" y="186" text-anchor="middle" font-size="11" fill="#888">their own stream</text>
+
+            <rect x="14" y="220" width="230" height="86" rx="8" fill="#fff" stroke="#111" stroke-width="1.4"/>
+            <text x="129" y="248" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111">/proc/pressure · vmstat</text>
+            <text x="129" y="270" text-anchor="middle" font-size="11" fill="#666">PSI + oom_kill counters</text>
+            <text x="129" y="288" text-anchor="middle" font-size="11" fill="#888">polled · no BPF</text>
+
+            <!-- rings -->
+            <rect x="300" y="16" width="250" height="86" rx="8" fill="#f2f2f2" stroke="#111" stroke-width="1.4"/>
+            <text x="425" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="#111">EVENTS ringbuf</text>
+            <text x="425" y="66" text-anchor="middle" font-size="11" fill="#666">64-byte records</text>
+            <text x="425" y="84" text-anchor="middle" font-size="11" fill="#888">8 MB · hot path</text>
+
+            <rect x="300" y="118" width="250" height="86" rx="8" fill="#f2f2f2" stroke="#111" stroke-width="1.4"/>
+            <text x="425" y="146" text-anchor="middle" font-size="13" font-weight="700" fill="#111">LIFECYCLE ringbuf</text>
+            <text x="425" y="168" text-anchor="middle" font-size="11" fill="#666">fork / exec / exit</text>
+            <text x="425" y="186" text-anchor="middle" font-size="11" fill="#888">512 KB · isolated</text>
+
+            <!-- daemon -->
+            <text x="700" y="212" font-size="10" letter-spacing="1.5" fill="#888">USERSPACE · blackboxd</text>
+            <rect x="300" y="220" width="560" height="190" rx="10" fill="#fbfbfb" stroke="#111" stroke-width="2"/>
+            <text x="580" y="246" text-anchor="middle" font-size="13.5" font-weight="700" fill="#111">daemon — collector · trigger-poller · IPC</text>
+            <text x="580" y="266" text-anchor="middle" font-size="11" fill="#888">three threads · one locked Runtime · shared state</text>
+            <rect x="318" y="282" width="258" height="56" rx="6" fill="#fff" stroke="#111" stroke-width="1.2"/>
+            <text x="447" y="304" text-anchor="middle" font-size="12" font-weight="700" fill="#111">collector thread</text>
+            <text x="447" y="322" text-anchor="middle" font-size="10.5" fill="#666">decode → HistoryRing · LifecycleRing</text>
+            <rect x="584" y="282" width="258" height="56" rx="6" fill="#fff" stroke="#111" stroke-width="1.2"/>
+            <text x="713" y="304" text-anchor="middle" font-size="12" font-weight="700" fill="#111">trigger poller</text>
+            <text x="713" y="322" text-anchor="middle" font-size="10.5" fill="#666">hysteresis over PSI + OOM → dump</text>
+            <text x="580" y="372" text-anchor="middle" font-size="11" fill="#666">IPC thread · Unix socket · bounded VecDeque windows</text>
+
+            <!-- CLI + outputs -->
+            <rect x="880" y="16" width="266" height="86" rx="8" fill="#fff" stroke="#111" stroke-width="1.4"/>
+            <text x="1013" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="#111">blackbox CLI</text>
+            <text x="1013" y="66" text-anchor="middle" font-size="11" fill="#666">start · status · dump · report</text>
+            <text x="1013" y="84" text-anchor="middle" font-size="11" fill="#888">over a Unix socket</text>
+
+            <rect x="880" y="220" width="266" height="86" rx="8" fill="#fff" stroke="#111" stroke-width="1.4"/>
+            <text x="1013" y="248" text-anchor="middle" font-size="13" font-weight="700" fill="#111">JSON dump · schema v2</text>
+            <text x="1013" y="270" text-anchor="middle" font-size="11" fill="#666">self-describing · host meta</text>
+            <text x="1013" y="288" text-anchor="middle" font-size="11" fill="#888">window · triggers · overhead</text>
+
+            <rect x="880" y="324" width="266" height="86" rx="8" fill="#fff" stroke="#111" stroke-width="1.4"/>
+            <text x="1013" y="352" text-anchor="middle" font-size="13" font-weight="700" fill="#111">report</text>
+            <text x="1013" y="374" text-anchor="middle" font-size="11" fill="#666">plain text · Perfetto</text>
+            <text x="1013" y="392" text-anchor="middle" font-size="11" fill="#888">offline · unprivileged</text>
+
+            <!-- arrows -->
+            <line x1="244" y1="59" x2="298" y2="59" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <line x1="244" y1="161" x2="298" y2="161" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <line x1="244" y1="263" x2="298" y2="263" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <line x1="425" y1="102" x2="425" y2="218" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <line x1="425" y1="204" x2="425" y2="218" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <line x1="860" y1="263" x2="878" y2="263" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <line x1="1013" y1="310" x2="1013" y2="322" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <polyline points="1013,102 1013,196 862,196" fill="none" stroke="#111" stroke-width="1.8" marker-end="url(#arr)"/>
+            <text x="928" y="188" font-size="10" fill="#888">status / dump</text>
+          </svg>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>5</span></div>
+      </section>
+
+      <!-- ============ 6 · BPF HALF ============ -->
       <section class="slide" data-t="The BPF half, deliberately minimal">
         <div class="kicker">Inside the object</div>
         <h1 class="title">The BPF half is deliberately dumb</h1>
@@ -429,264 +506,424 @@ longest sched delay: 2.0 ms — <span class="s">reproduced after the fact</span>
             <div class="stat"><div class="big">2</div><div class="lbl">independent ring buffers</div><div class="sub">a fork storm can never perturb the switch hot path or its layout</div></div>
             <div class="stat"><div class="big">CO-RE</div><div class="lbl">BTF, kernel ≥ 5.15</div><div class="sub">one prebuilt object runs across compatible kernels</div></div>
           </div>
-          <div class="grid2" style="margin-top:4px;">
+          <div class="grid2" style="margin-top:2px;">
             <div style="display:flex; flex-direction:column; gap:9px; justify-content:center;">
-              <ul class="list" style="font-size:15px;">
+              <ul class="list" style="font-size:14.5px;">
                 <li>It <b>stamps the CPU id</b> (not in the tracepoint payload) and copies records. That’s it.</li>
-                <li>Verifier-friendly: bounded loops, no unbounded helpers, licence declared <span class="mono" style="font-size:12.5px;">Dual MIT/GPL</span> for the kernel’s GPL-only helpers.</li>
-                <li>Userspace rejects a record that isn’t exactly 64 bytes — <b>no silent misparse</b>.</li>
+                <li>Verifier-friendly: bounded loops, no unbounded helpers; licence declared <span class="mono" style="font-size:12px;">Dual MIT/GPL</span> for the kernel’s GPL-only helpers.</li>
+                <li>Userspace rejects any record that isn’t exactly 64 bytes — <b>no silent misparse</b>.</li>
               </ul>
             </div>
-            <div>
-              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase; margin-bottom:12px;">sched_switch record · 64 bytes</div>
-              <div class="rec">
-                <div class="f" style="flex:2;"><span class="n">ts_ns · u64</span><span class="o">0</span></div>
-                <div class="f" style="flex:2;"><span class="n">prev_state · i64</span><span class="o">8</span></div>
-                <div class="f" style="flex:1;"><span class="n">prev_pid</span><span class="o">16</span></div>
-                <div class="f" style="flex:1;"><span class="n">next_pid</span><span class="o">20</span></div>
-                <div class="f" style="flex:1;"><span class="n">cpu</span><span class="o">24</span></div>
-                <div class="f" style="flex:2;"><span class="n">prev_comm[16]</span><span class="o">28</span></div>
-                <div class="f" style="flex:2;"><span class="n">next_comm[16]</span><span class="o">44</span></div>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="slide-footer"><span>Blackbox</span><span>5</span></div>
-      </section>
+            <div class="graph-box">
+              <div class="graph-cap">sched_switch record · 64 bytes · 7 fields</div>
+              <svg viewBox="0 0 640 118" width="100%">
+                <g font-size="10.5">
+                  <rect x="0"   y="26" width="100" height="58" fill="#fafafa" stroke="#111" stroke-width="1.2"/>
+                  <text x="50"  y="46" text-anchor="middle" font-size="11.5" font-weight="700" fill="#111">ts_ns</text>
+                  <text x="50"  y="64" text-anchor="middle" font-size="9.5" fill="#777">u64</text>
+                  <text x="50"  y="104" text-anchor="middle" font-size="9" fill="#999">@0</text>
 
-      <!-- ============ 6 · DESIGN DECISIONS ============ -->
-      <section class="slide" data-t="Two design decisions">
-        <div class="kicker">Design</div>
-        <h1 class="title">Two decisions most of the architecture follows from</h1>
-        <div class="slide-body">
-          <div class="grid2" style="flex:1;">
-            <div class="card" style="display:flex; flex-direction:column; gap:10px;">
-              <h3><span class="num" style="color:var(--accent); border-color:rgba(34,211,238,.4);">1</span>The ring buffer is transport only — <b>history lives in user space</b></h3>
-              <p>A BPF ring buffer cannot retain history: it overwrites the oldest unread records. So the real “last N seconds” is a bounded <code>VecDeque</code> in <code>blackbox-core</code>, refilled continuously.</p>
-              <div class="banner red" style="margin-top:auto;">
-                <span>⚠</span><span>Honest consequence: history exists only while <b>blackboxd is running</b>. A killed daemon leaves a short window.</span>
-              </div>
-            </div>
-            <div class="card" style="display:flex; flex-direction:column; gap:10px;">
-              <h3><span class="num" style="color:var(--accent-2); border-color:rgba(167,139,250,.4);">2</span>All the hard logic is <b>pure, testable Rust</b></h3>
-              <p>Interval reconstruction, ranking consumers, PSI hysteresis, report formatting — everything that costs verifier budget and runtime sits in <code>blackbox-core</code>, which runs with no privileges.</p>
-              <div class="banner" style="margin-top:auto;">
-                <span>🧪</span><span>That split is why the whole brain of the tool is covered by ordinary <code>cargo test</code> — 180 tests, zero root.</span>
-              </div>
+                  <rect x="100" y="26" width="100" height="58" fill="#f5f5f5" stroke="#111" stroke-width="1.2"/>
+                  <text x="150" y="46" text-anchor="middle" font-size="11.5" font-weight="700" fill="#111">prev_state</text>
+                  <text x="150" y="64" text-anchor="middle" font-size="9.5" fill="#777">i64</text>
+                  <text x="150" y="104" text-anchor="middle" font-size="9" fill="#999">@8</text>
+
+                  <rect x="200" y="26" width="72" height="58" fill="#ffffff" stroke="#111" stroke-width="1.2"/>
+                  <text x="236" y="46" text-anchor="middle" font-size="10.5" font-weight="700" fill="#111">prev_pid</text>
+                  <text x="236" y="64" text-anchor="middle" font-size="9.5" fill="#777">u32</text>
+                  <text x="236" y="104" text-anchor="middle" font-size="9" fill="#999">@16</text>
+
+                  <rect x="272" y="26" width="72" height="58" fill="#ffffff" stroke="#111" stroke-width="1.2"/>
+                  <text x="308" y="46" text-anchor="middle" font-size="10.5" font-weight="700" fill="#111">next_pid</text>
+                  <text x="308" y="64" text-anchor="middle" font-size="9.5" fill="#777">u32</text>
+                  <text x="308" y="104" text-anchor="middle" font-size="9" fill="#999">@20</text>
+
+                  <rect x="344" y="26" width="72" height="58" fill="#ffffff" stroke="#111" stroke-width="1.2"/>
+                  <text x="380" y="46" text-anchor="middle" font-size="10.5" font-weight="700" fill="#111">cpu</text>
+                  <text x="380" y="64" text-anchor="middle" font-size="9.5" fill="#777">u32</text>
+                  <text x="380" y="104" text-anchor="middle" font-size="9" fill="#999">@24</text>
+
+                  <rect x="416" y="26" width="112" height="58" fill="#f0f0f0" stroke="#111" stroke-width="1.2"/>
+                  <text x="472" y="46" text-anchor="middle" font-size="10.5" font-weight="700" fill="#111">prev_comm</text>
+                  <text x="472" y="64" text-anchor="middle" font-size="9.5" fill="#777">[16]</text>
+                  <text x="472" y="104" text-anchor="middle" font-size="9" fill="#999">@28</text>
+
+                  <rect x="528" y="26" width="112" height="58" fill="#f0f0f0" stroke="#111" stroke-width="1.2"/>
+                  <text x="584" y="46" text-anchor="middle" font-size="10.5" font-weight="700" fill="#111">next_comm</text>
+                  <text x="584" y="64" text-anchor="middle" font-size="9.5" fill="#777">[16]</text>
+                  <text x="584" y="104" text-anchor="middle" font-size="9" fill="#999">@44</text>
+                </g>
+                <text x="640" y="114" text-anchor="end" font-size="9.5" fill="#888">= 64 B total</text>
+              </svg>
             </div>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>6</span></div>
       </section>
 
-      <!-- ============ 7 · READING THE TRACE ============ -->
-      <section class="slide" data-t="Reading the trace">
-        <div class="kicker">Reconstruction</div>
-        <h1 class="title">Switches in, answers out</h1>
+      <!-- ============ 7 · TWO DESIGN DECISIONS ============ -->
+      <section class="slide" data-t="Two design decisions">
+        <div class="kicker">Design</div>
+        <h1 class="title">Two decisions most of the architecture follows from</h1>
         <div class="slide-body">
           <div class="grid2" style="flex:1;">
-            <ul class="list" style="justify-content:center;">
-              <li>Consecutive switches on a CPU are <b>rebuilt into on-CPU intervals</b> — who actually held each core, for how long.</li>
-              <li><b>prev_state</b> separates the two failure modes:
-                <div style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
-                  <div class="banner" style="padding:10px 14px; font-size:13.5px;"><span>⚡</span><span><b>prev_state = 0</b> → task was runnable and lost the CPU → <b>scheduler latency</b> (→ longest-delay ranking)</span></div>
-                  <div class="banner amber" style="padding:10px 14px; font-size:13.5px;"><span>💤</span><span><b>prev_state ≠ 0</b> → task slept / waited on I/O → <b>blocked time</b></span></div>
-                </div>
-              </li>
-              <li>Lifecycle events ride their own stream and render as <b>instant markers</b> — a fork storm or a respawning daemon shows up next to the CPU picture.</li>
-            </ul>
-            <div style="display:flex; flex-direction:column; gap:12px; justify-content:center;">
-              <div class="code" style="font-size:12.5px;"><span class="c"># longest scheduler delays</span>
-   2.0 ms  pid 0     swapper/3
-   1.8 ms  pid 69434 dav1d-worker
-   1.4 ms  pid 72208 trigger-poller</div>
-              <div class="code" style="font-size:12.5px;"><span class="c"># top cpu consumers (from the same trace)</span>
-  63.72%  swapper/3     2.56 s
-  10.91%  trigger-poller 438.9 ms
-   6.38%  bpf-collector 256.5 ms
-   3.88%  gnome-terminal- 155.9 ms</div>
-              <p style="font-size:12.5px; color:var(--faint); line-height:1.55;">Note the daemon measuring itself — <code>trigger-poller</code> and <code>bpf-collector</code> appear in the ranking. That’s honesty by construction.</p>
+            <div class="card" style="display:flex; flex-direction:column; gap:10px;">
+              <h3><span class="num">1</span>The ring buffer is transport only — <b>history lives in user space</b></h3>
+              <p style="font-size:13.5px;">A BPF ring buffer cannot retain history: it overwrites the oldest unread records. So the real “last N seconds” is a bounded <code>VecDeque</code> in <code>blackbox-core</code>, refilled continuously.</p>
+              <div class="banner red" style="margin-top:auto;">
+                <span class="ic">!</span><span>Honest consequence: history exists only while <b>blackboxd is running</b>. A killed daemon leaves a short window.</span>
+              </div>
+            </div>
+            <div class="card" style="display:flex; flex-direction:column; gap:10px;">
+              <h3><span class="num">2</span>All the hard logic is <b>pure, testable Rust</b></h3>
+              <p style="font-size:13.5px;">Interval reconstruction, ranking consumers, PSI hysteresis, report formatting — everything that costs verifier budget and runtime sits in <code>blackbox-core</code>, which runs with no privileges.</p>
+              <div class="banner" style="margin-top:auto;">
+                <span class="ic">◇</span><span>That split is why the whole brain of the tool is covered by ordinary <code>cargo test</code> — 180 tests, zero root.</span>
+              </div>
             </div>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>7</span></div>
       </section>
 
-      <!-- ============ 8 · TRIGGERS ============ -->
-      <section class="slide" data-t="Triggers">
-        <div class="kicker">Triggers</div>
-        <h1 class="title">The dump fires itself — with hysteresis</h1>
+      <!-- ============ 8 · READING THE TRACE (GANTT) ============ -->
+      <section class="slide" data-t="Reading the trace">
+        <div class="kicker">Reconstruction</div>
+        <h1 class="title">Switches in, answers out</h1>
         <div class="slide-body">
-          <div class="grid2" style="flex:1;">
-            <div class="trig">
-              <div class="row"><div class="ico">🧠</div><div><b>CPU pressure</b> <span class="tag" style="margin-left:6px;">PSI /proc/pressure/cpu</span><p>avg10 over threshold &nbsp;·&nbsp; default 80%</p></div></div>
-              <div class="row"><div class="ico">🧮</div><div><b>Memory pressure</b> <span class="tag" style="margin-left:6px;">PSI</span><p>runnable-or-blocked-on-memory skew · default 20%</p></div></div>
-              <div class="row"><div class="ico">💾</div><div><b>I/O pressure</b> <span class="tag" style="margin-left:6px;">PSI</span><p>tasks stalled on I/O · default 20%</p></div></div>
-              <div class="row"><div class="ico">☠️</div><div><b>OOM kill</b> <span class="tag" style="margin-left:6px;">/proc/vmstat</span><p>any advance of the <code>oom_kill</code> counter fires — needs no BPF, reports the kill count</p></div></div>
-              <div class="row"><div class="ico">✋</div><div><b>Manual</b> <span class="tag" style="margin-left:6px;">blackbox dump</span><p>take the trace now, whenever you want</p></div></div>
+          <div class="grid2" style="flex:1; align-items:stretch; gap:24px;">
+            <div style="display:flex; flex-direction:column; gap:12px; justify-content:center;">
+              <p class="lead" style="font-size:15px;">Consecutive switches on a CPU are <b>rebuilt into on-CPU intervals</b> — who held each core, for how long.</p>
+              <div class="banner" style="padding:10px 14px; font-size:13px;"><span class="ic">▤</span><span><b>prev_state = 0</b> → runnable, lost the CPU → <b>scheduler latency</b> (hatched)</span></div>
+              <div class="banner amber" style="padding:10px 14px; font-size:13px;"><span class="ic">▭</span><span><b>prev_state ≠ 0</b> → slept / waited on I/O → <b>blocked time</b> (dashed)</span></div>
+              <p style="font-size:12.5px; color:var(--muted); line-height:1.55;">Lifecycle events upgrade the picture: a fork storm or a respawning daemon shows up as instant markers next to the CPU lanes.</p>
+              <div class="code" style="font-size:12px; margin-top:2px;"><span class="c"># longest scheduler delays</span>
+   2.0 ms  pid 0     swapper/3
+   1.8 ms  pid 69434 dav1d-worker
+   1.4 ms  pid 72208 trigger-poller</div>
             </div>
-            <div style="display:flex; flex-direction:column; gap:16px; justify-content:center;">
-              <div class="card"><h3>Hysteresis — no dump storms</h3>
-                <p>A trigger must stay over threshold for <code>consecutive</code> samples (default 4 × 250 ms) before firing, and it <b>re-arms only once pressure recedes</b> below the threshold. A sustained stall dumps once, not forty times.</p>
-                <div style="display:flex; gap:8px; margin-top:14px; align-items:center; font-family:var(--mono); font-size:11px; color:var(--faint);">
-                  <span style="color:var(--muted);">over</span><span class="tag">×4</span><span style="color:var(--muted);">→</span><span style="color:var(--warn);">fire ✓</span><span style="color:var(--muted);">· recedes →</span><span style="color:var(--accent);">re-arm</span>
-                </div>
-              </div>
-              <div class="card"><h3>Every dump is self-describing</h3>
-                <p>Schema version, trigger reason + time, host identity, window bounds (monotonic <i>and</i> wall-clock), and the daemon’s own overhead counters ride along with the events.</p>
-              </div>
+            <div class="graph-box">
+              <div class="graph-cap">reconstructed scheduling graph · 2 CPUs</div>
+              <svg viewBox="0 0 560 300" width="100%">
+                <!-- lane 0 -->
+                <text x="8" y="62" font-size="11" font-weight="700" fill="#111">CPU 0</text>
+                <rect x="34" y="34" width="514" height="46" fill="#f6f6f6"
+                      stroke="#ccc" stroke-width="1"/>
+                <rect x="44" y="34" width="120" height="46" fill="#111"/>
+                <text x="104" y="62" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">cmd A</text>
+                <rect x="164" y="34" width="52" height="46" fill="url(#hatch)"/>
+                <text x="190" y="30" text-anchor="middle" font-size="8.5" fill="#666">runnable</text>
+                <rect x="216" y="34" width="116" height="46" fill="#111"/>
+                <text x="274" y="62" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">cmd B</text>
+                <rect x="332" y="34" width="58" height="46" fill="#fff" stroke="#666" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="361" y="30" text-anchor="middle" font-size="8.5" fill="#666">I/O</text>
+                <rect x="390" y="34" width="104" height="46" fill="#111"/>
+                <text x="442" y="62" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">cmd C</text>
+                <rect x="494" y="34" width="54" height="46" fill="url(#hatch)"/>
+                <!-- lane 1 -->
+                <text x="8" y="156" font-size="11" font-weight="700" fill="#111">CPU 1</text>
+                <rect x="34" y="128" width="514" height="46" fill="#f6f6f6"
+                      stroke="#ccc" stroke-width="1"/>
+                <rect x="64" y="128" width="112" height="46" fill="#111"/>
+                <text x="120" y="156" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">cmd D</text>
+                <rect x="176" y="128" width="48" height="46" fill="url(#hatch)"/>
+                <rect x="224" y="128" width="140" height="46" fill="#111"/>
+                <text x="294" y="156" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">cmd E</text>
+                <rect x="364" y="128" width="64" height="46" fill="#fff" stroke="#666" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="396" y="124" text-anchor="middle" font-size="8.5" fill="#666">I/O</text>
+                <rect x="428" y="128" width="120" height="46" fill="#111"/>
+                <text x="488" y="156" text-anchor="middle" font-size="10.5" fill="#fff" font-weight="600">cmd F</text>
+                <!-- lifecycle markers -->
+                <line x1="34" y1="212" x2="548" y2="212" stroke="#999" stroke-width="1"/>
+                <line x1="294" y1="174" x2="294" y2="212" stroke="#999" stroke-width="1" stroke-dasharray="3 3"/>
+                <line x1="396" y1="174" x2="396" y2="212" stroke="#999" stroke-width="1" stroke-dasharray="3 3"/>
+                <line x1="488" y1="174" x2="488" y2="212" stroke="#999" stroke-width="1" stroke-dasharray="3 3"/>
+                <polygon points="288,206 300,206 294,196" fill="#111"/>
+                <text x="294" y="230" text-anchor="middle" font-size="10" fill="#111">fork</text>
+                <circle cx="396" cy="201" r="4.5" fill="#fff" stroke="#111" stroke-width="1.6"/>
+                <text x="396" y="230" text-anchor="middle" font-size="10" fill="#111">exec</text>
+                <polygon points="482,206 494,206 488,196" fill="#111"/>
+                <line x1="482" y1="197" x2="494" y2="207" stroke="#111" stroke-width="1.6"/>
+                <line x1="494" y1="197" x2="482" y2="207" stroke="#111" stroke-width="1.6"/>
+                <text x="488" y="230" text-anchor="middle" font-size="10" fill="#111">exit</text>
+                <!-- legend -->
+                <g font-size="9.5" fill="#666">
+                  <rect x="60" y="266" width="12" height="12" fill="#111"/>
+                  <text x="78" y="276">on-CPU</text>
+                  <rect x="150" y="266" width="12" height="12" fill="url(#hatch)" stroke="#666" stroke-width="0.5"/>
+                  <text x="168" y="276">runnable · waiting (latency)</text>
+                  <rect x="316" y="266" width="12" height="12" fill="#fff" stroke="#666" stroke-width="1.2" stroke-dasharray="3 2"/>
+                  <text x="334" y="276">blocked (sleep / I-O)</text>
+                </g>
+              </svg>
             </div>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>8</span></div>
       </section>
 
-      <!-- ============ 9 · DUMP & REPORTS ============ -->
-      <section class="slide" data-t="Dump & reports">
-        <div class="kicker">After it fires</div>
-        <h1 class="title">One trace, two ways to read it</h1>
+      <!-- ============ 9 · TRIGGERS (HYSTERESIS CHART) ============ -->
+      <section class="slide" data-t="Triggers">
+        <div class="kicker">Triggers</div>
+        <h1 class="title">The dump fires itself — with hysteresis</h1>
         <div class="slide-body">
           <div class="grid2" style="flex:1;">
-            <div style="display:flex; flex-direction:column; gap:12px;">
-              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase;">The dump · JSON schema v2</div>
-              <div class="code" style="font-size:12px; flex:1;">{
-  <span class="s">"schema"</span>: 2,          <span class="c">// v1 traces still load</span>
-  <span class="s">"trigger"</span>: { <span class="s">"reason"</span>: <span class="s">"psi_cpu"</span>, … },
-  <span class="s">"host"</span>: { <span class="s">"hostname"</span>: …, <span class="s">"os"</span>: …, <span class="s">"kernel"</span>: … },
-  <span class="s">"window"</span>: { <span class="s">"start_mono_ns"</span>: …,
-              <span class="s">"start_wall_utc"</span>: …, <span class="s">"end"</span>: …,
-              <span class="s">"truncated"</span>: false },
-  <span class="s">"events"</span>: [ 64-byte sched_switch … ],
-  <span class="s">"lifecycle"</span>: [ fork / exec / exit … ]
-}</div>
+            <div class="trig" style="display:flex; flex-direction:column; gap:12px; justify-content:center;">
+              <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div style="width:30px;height:30px;border:1.5px solid #111;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;flex:none;background:#fff;">◼</div>
+                <div><b style="font-size:14.5px;">CPU pressure</b> <span class="tag" style="margin-left:6px;">PSI cpu</span><p style="font-size:12.5px;color:var(--muted);margin-top:2px;">avg10 over threshold · default 80%</p></div>
+              </div>
+              <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div style="width:30px;height:30px;border:1.5px solid #111;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;flex:none;background:#f5f5f5;">▦</div>
+                <div><b style="font-size:14.5px;">Memory pressure</b> <span class="tag" style="margin-left:6px;">PSI memory</span><p style="font-size:12.5px;color:var(--muted);margin-top:2px;">runnable-or-blocked-on-memory skew · default 20%</p></div>
+              </div>
+              <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div style="width:30px;height:30px;border:1.5px solid #111;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;flex:none;background:#f5f5f5;">▭</div>
+                <div><b style="font-size:14.5px;">I/O pressure</b> <span class="tag" style="margin-left:6px;">PSI io</span><p style="font-size:12.5px;color:var(--muted);margin-top:2px;">tasks stalled on I/O · default 20%</p></div>
+              </div>
+              <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div style="width:30px;height:30px;border:1.5px solid #111;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;flex:none;background:#111;color:#fff;">×</div>
+                <div><b style="font-size:14.5px;">OOM kill</b> <span class="tag" style="margin-left:6px;">/proc/vmstat</span><p style="font-size:12.5px;color:var(--muted);margin-top:2px;">any advance of the <code>oom_kill</code> counter fires — no BPF needed</p></div>
+              </div>
+              <div style="display:flex; align-items:flex-start; gap:12px;">
+                <div style="width:30px;height:30px;border:1.5px solid #111;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;flex:none;background:#fff;">◉</div>
+                <div><b style="font-size:14.5px;">Manual</b> <span class="tag" style="margin-left:6px;">blackbox dump</span><p style="font-size:12.5px;color:var(--muted);margin-top:2px;">take the trace now, whenever you want</p></div>
+              </div>
             </div>
-            <div style="display:flex; flex-direction:column; gap:12px;">
-              <div class="card"><h3>📄 Text report · <code>blackbox report f.json</code></h3>
-                <ul class="list" style="gap:7px; font-size:14px;">
-                  <li>Top CPU consumers, per CPU or whole-host</li>
-                  <li>Longest scheduler delays — runnable tasks waiting on a CPU</li>
-                  <li>Most blocked time; lifecycle section; <code>--top N</code></li>
-                </ul>
+            <div style="display:flex; flex-direction:column; gap:14px; justify-content:center;">
+              <div class="graph-box">
+                <div class="graph-cap">hysteresis · no dump storms</div>
+                <svg viewBox="0 0 560 250" width="100%">
+                  <line x1="40" y1="16" x2="40" y2="212" stroke="#333" stroke-width="1.4"/>
+                  <line x1="40" y1="210" x2="520" y2="210" stroke="#333" stroke-width="1.4"/>
+                  <line x1="40" y1="40" x2="520" y2="40" stroke="#ddd" stroke-width="1" stroke-dasharray="2 4"/>
+                  <text x="36" y="44" text-anchor="end" font-size="9" fill="#999">100%</text>
+                  <text x="36" y="110" text-anchor="end" font-size="9" fill="#999">50%</text>
+                  <!-- threshold -->
+                  <line x1="40" y1="78" x2="520" y2="78" stroke="#111" stroke-width="1.4" stroke-dasharray="7 4"/>
+                  <text x="440" y="60" font-size="10" fill="#444">threshold · 80%</text>
+                  <!-- above-threshold hatch -->
+                  <rect x="150" y="50" width="144" height="28" fill="url(#hatch)"/>
+                  <!-- pressure line -->
+                  <polyline points="40,196 90,178 150,72 198,64 246,58 294,50 344,150 396,128 448,154 500,166"
+                            fill="none" stroke="#111" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
+                  <!-- sample ticks -->
+                  <g stroke="#999" stroke-width="1">
+                    <line x1="40"  y1="210" x2="40"  y2="216"/>
+                    <line x1="90"  y1="210" x2="90"  y2="216"/>
+                    <line x1="150" y1="210" x2="150" y2="216"/>
+                    <line x1="198" y1="210" x2="198" y2="216"/>
+                    <line x1="246" y1="210" x2="246" y2="216"/>
+                    <line x1="294" y1="210" x2="294" y2="216"/>
+                    <line x1="344" y1="210" x2="344" y2="216"/>
+                    <line x1="396" y1="210" x2="396" y2="216"/>
+                    <line x1="448" y1="210" x2="448" y2="216"/>
+                    <line x1="500" y1="210" x2="500" y2="216"/>
+                  </g>
+                  <text x="500" y="230" text-anchor="end" font-size="9.5" fill="#888">250 ms samples</text>
+                  <!-- fire -->
+                  <polygon points="286,44 302,44 294,30" fill="#111"/>
+                  <text x="322" y="40" font-size="11" font-weight="700" fill="#111">fire → dump</text>
+                  <!-- re-arm -->
+                  <circle cx="344" cy="150" r="5" fill="#fff" stroke="#111" stroke-width="1.6"/>
+                  <text x="364" y="154" font-size="10.5" fill="#444">pressure recedes → re-arm</text>
+                </svg>
               </div>
-              <div class="card"><h3>📈 Perfetto · <code>blackbox report --perfetto</code></h3>
-                <p>Chrome-format JSON you drag straight onto <b>ui.perfetto.dev</b>: per-CPU scheduling lanes, blocked/sleep states, and lifecycle instant markers.</p>
-                <div class="code" style="margin-top:10px; font-size:12px;">$ blackbox report incident.json --perfetto &gt; t.json
-<span class="c"># → drag t.json onto ui.perfetto.dev</span></div>
+              <div class="card" style="border-top-color:#111; padding:14px 16px;">
+                <h3 style="font-size:14px;">How the guard works</h3>
+                <p>A trigger must stay over threshold for <code>consecutive</code> samples (default 4 × 250 ms) before firing, and it <b>re-arms only once pressure recedes</b>. A sustained stall dumps once, not forty times — every dump carries the trigger reason.</p>
               </div>
-              <div class="banner" style="margin-top:auto;"><span>🔒</span><span>Runs offline and unprivileged — the exporter is pure Rust, no daemon needed to re-read a dump.</span></div>
             </div>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>9</span></div>
       </section>
 
-      <!-- ============ 10 · CLI ============ -->
-      <section class="slide" data-t="CLI and lifecycle">
-        <div class="kicker">Operations</div>
-        <h1 class="title">Four commands in, clean lifecycle out</h1>
+      <!-- ============ 10 · DUMP & REPORTS ============ -->
+      <section class="slide" data-t="Dump & reports">
+        <div class="kicker">After it fires</div>
+        <h1 class="title">One trace, two ways to read it</h1>
         <div class="slide-body">
-          <div class="code" style="font-size:14px;">$ sudo blackbox start        <span class="c"># detached daemon · --foreground for services</span>
-$ blackbox status             <span class="c"># health · collection · last trigger</span>
-$ blackbox dump -o inc.json   <span class="c"># manual trace NOW</span>
-$ blackbox report inc.json    <span class="c"># text …</span>
-$ blackbox report inc.json --perfetto &gt; t.json   <span class="c"># …or Perfetto</span></div>
-          <div class="grid3" style="margin-top:6px;">
-            <div class="card"><h3>🛰 Daemon + CLI</h3><p>Line-delimited JSON over a <b>Unix socket</b>; three threads (collect · trigger-poll · IPC) share one locked <code>Runtime</code>.</p></div>
-            <div class="card"><h3>🪂 Graceful degradation</h3><p>No object / no privileges / no BTF? BPF stays off, <b>PSI + OOM dumps and <code>status</code> keep working</b> — and status says exactly why.</p></div>
-            <div class="card"><h3>🧹 Clean shutdown</h3><p><code>SIGINT</code>/<code>SIGTERM</code> stop both workers in a few hundred ms, remove socket + pidfile; dump retention keeps the newest <code>K</code>; systemd unit included.</p></div>
-          </div>
-          <div class="grid2" style="margin-top:6px;">
-            <div class="banner amber"><span>🎚</span><span><b>Config</b> — <code>history</code>, <code>pressure</code>, <code>dump</code>, <code>bpf</code> sections. Missing file = defaults; unknown key = hard startup error.</span></div>
-            <div class="banner"><span>🎯</span><span><b>PID filter</b> — <code>[bpf] filter_pids</code> narrows machine-wide tracing to a few processes (more on the next slide).</span></div>
+          <div class="grid2" style="flex:1; gap:22px;">
+            <div style="display:flex; flex-direction:column; gap:10px;">
+              <div class="graph-cap">the dump · JSON schema v2</div>
+              <div class="code" style="font-size:12px; flex:1; margin:0;"><span class="k">{</span>
+  <span class="s">"schema"</span>: 2,          <span class="c">// v1 traces still load</span>
+  <span class="s">"trigger"</span>: { <span class="s">"reason"</span>: <span class="s">"psi_cpu"</span>, … },
+  <span class="s">"host"</span>: { <span class="s">"hostname"</span>: …, <span class="s">"os"</span>: …,
+             <span class="s">"kernel"</span>: … },
+  <span class="s">"window"</span>: { <span class="s">"start_mono_ns"</span>: …,
+              <span class="s">"start_wall_utc"</span>: …, <span class="s">"end"</span>: …,
+              <span class="s">"truncated"</span>: false },
+  <span class="s">"events"</span>: [ 64-byte sched_switch … ],
+  <span class="s">"lifecycle"</span>: [ fork / exec / exit … ]
+<span class="k">}</span></div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:12px;">
+              <div class="card"><h3>▤ Text report · <code>blackbox report f.json</code></h3>
+                <ul class="list" style="gap:5px; font-size:13px;">
+                  <li>Top CPU consumers, per CPU or whole-host</li>
+                  <li>Longest scheduler delays — runnable tasks waiting on a CPU</li>
+                  <li>Most blocked time · lifecycle section · <code>--top N</code></li>
+                </ul>
+              </div>
+              <div class="card"><h3>↗ Perfetto · <code>report --perfetto</code></h3>
+                <p>Chrome-format JSON you drag straight onto <b>ui.perfetto.dev</b>: per-CPU scheduling lanes, blocked / sleep states, and lifecycle markers.</p>
+                <div class="code" style="margin-top:10px; font-size:11.5px;"><span class="k">$</span> blackbox report f.json --perfetto &gt; t.json
+<span class="c"># → drag t.json onto ui.perfetto.dev</span></div>
+              </div>
+              <div class="banner" style="margin-top:auto;">
+                <span class="ic">●</span><span>Runs offline and unprivileged — the exporter is pure Rust, no daemon needed to re-read a dump.</span>
+              </div>
+            </div>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>10</span></div>
       </section>
 
-      <!-- ============ 11 · OVERHEAD ============ -->
-      <section class="slide" data-t="Overhead, measured honestly">
-        <div class="kicker">Cost</div>
-        <h1 class="title">It reads every switch — so it is not free</h1>
+      <!-- ============ 11 · CLI & OPERATIONS ============ -->
+      <section class="slide" data-t="CLI and operations">
+        <div class="kicker">Operations</div>
+        <h1 class="title">Four commands in, clean lifecycle out</h1>
         <div class="slide-body">
-          <p class="lead" style="font-size:15.5px;">Cost scales with the <b>machine-wide context-switch rate</b>, not CPU load. Measured on an 8-core host running a switch-only workload (400k switches / run):</p>
-          <div class="stat-row">
-            <div class="stat"><div class="big">+26–63%</div><div class="lbl">switch-heavy workload</div><div class="sub">noisy shared host — treat as indicative · ~0.6–1.7 µs per switch caused</div></div>
-            <div class="stat"><div class="big">~0.6</div><div class="lbl">core, daemon CPU</div><div class="sub">the stable figure across runs · lifecycle tracepoints add nothing measurable</div></div>
-            <div class="stat"><div class="big">≈ 0</div><div class="lbl">compute-bound workload</div><div class="sub">blackbox runs no code on compute — the control is untouched</div></div>
+          <div class="code" style="font-size:13.5px;"><span class="k">$</span> sudo blackbox start        <span class="c"># detached daemon · --foreground for services</span>
+<span class="k">$</span> blackbox status             <span class="c"># health · collection mode · last trigger</span>
+<span class="k">$</span> blackbox dump -o inc.json   <span class="c"># manual trace NOW</span>
+<span class="k">$</span> blackbox report inc.json --perfetto &gt; t.json  <span class="c"># text by default → drag t.json onto Perfetto</span></div>
+          <div class="grid3">
+            <div class="card"><h3>⌁ Daemon + CLI</h3><p>Line-delimited JSON over a <b>Unix socket</b>; three threads (collect · trigger-poll · IPC) share one locked <code>Runtime</code>.</p></div>
+            <div class="card"><h3>▽ Graceful degradation</h3><p>No object / no privileges / no BTF? BPF stays off, <b>PSI + OOM dumps and <code>status</code> keep working</b> — and status says exactly why.</p></div>
+            <div class="card"><h3>○ Clean shutdown</h3><p><code>SIGINT</code>/<code>SIGTERM</code> stop both workers in a few hundred ms, remove socket + pidfile; retention keeps the newest <code>K</code>; systemd unit included.</p></div>
           </div>
-          <div class="grid2" style="margin-top:6px;">
-            <div class="card"><h3>🎯 The mitigation: PID filter</h3><p>Set <code>[bpf] filter_pids</code> and only those pids’ events reach the ring, the decode and the history.</p>
-              <div class="stat-row" style="margin-top:12px;">
-                <div class="stat"><div class="big">66% → 0.15%</div><div class="lbl">daemon CPU (one core)</div></div>
-                <div class="stat"><div class="big">+26–41% → +1.5–4.7%</div><div class="lbl">workload cost</div></div>
-              </div>
-              <p style="font-size:12.5px; color:var(--faint); margin-top:10px;">The tracepoint still fires either way — the filter removes the <b>ingest</b>, not the hook.</p>
-            </div>
-            <div class="card"><h3>🧪 And the tool tests itself</h3><p>Writing the benchmark found a real bug — a PSI poller that spun because a <code>continue</code> skipped its sleep — and fixing it cut daemon CPU from <b>1.6 → 0.6 cores</b>. The daemon’s own threads show up in its reports, measured with the same yardstick.</p>
-              <div class="code" style="margin-top:10px; font-size:12px;">$ sudo scripts/bench.sh
-$ sudo FILTER_PIDS=999999 scripts/bench.sh</div>
-            </div>
+          <div class="grid2">
+            <div class="banner amber"><span class="ic">▬</span><span><b>Config</b> — <code>history</code>, <code>pressure</code>, <code>dump</code>, <code>bpf</code> sections. Missing file = defaults; unknown key = hard startup error.</span></div>
+            <div class="banner"><span class="ic">◉</span><span><b>PID filter</b> — <code>[bpf] filter_pids</code> narrows machine-wide tracing to a few processes (more on the next slide).</span></div>
           </div>
         </div>
         <div class="slide-footer"><span>Blackbox</span><span>11</span></div>
       </section>
 
-      <!-- ============ 12 · TRY IT ============ -->
+      <!-- ============ 12 · OVERHEAD (BAR CHARTS) ============ -->
+      <section class="slide" data-t="Overhead, measured honestly">
+        <div class="kicker">Cost</div>
+        <h1 class="title">It reads every switch — so it is not free</h1>
+        <div class="slide-body">
+          <p class="lead" style="font-size:15px;">Cost scales with the <b>machine-wide context-switch rate</b>, not CPU load. Measured on an 8-core host running a switch-only workload (≈400k switches / run, REPS=7).</p>
+          <div class="graph-box" style="padding:10px 18px 12px;">
+            <svg viewBox="0 0 1160 250" width="100%">
+              <!-- group A labels -->
+              <text x="150" y="20" text-anchor="middle" font-size="13" font-weight="700" fill="#111">daemon CPU · fraction of one core</text>
+              <line x1="70" y1="205" x2="470" y2="205" stroke="#333" stroke-width="1.4"/>
+              <line x1="70" y1="205" x2="70" y2="30" stroke="#999" stroke-width="1"/>
+              <g stroke="#ddd" stroke-width="1">
+                <line x1="70" y1="65" x2="470" y2="65"/>
+                <line x1="70" y1="135" x2="470" y2="135"/>
+              </g>
+              <text x="64" y="69" text-anchor="end" font-size="9" fill="#999">0.6</text>
+              <text x="64" y="139" text-anchor="end" font-size="9" fill="#999">0.3</text>
+              <!-- machine-wide 0.60 core : 140px scale = 0.70 -->
+              <rect x="130" y="85" width="108" height="120" fill="#111"/>
+              <text x="184" y="76" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111">66% of a core</text>
+              <text x="184" y="222" text-anchor="middle" font-size="10.5" fill="#666">machine-wide</text>
+              <!-- pid-filtered 0.0015 core -->
+              <rect x="360" y="200" width="108" height="5" fill="url(#hatch)" stroke="#666" stroke-width="0.8"/>
+              <text x="414" y="76" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111">0.15% of a core</text>
+              <text x="414" y="222" text-anchor="middle" font-size="10.5" fill="#666">pid-filtered</text>
+
+              <!-- group B -->
+              <text x="830" y="20" text-anchor="middle" font-size="13" font-weight="700" fill="#111">workload cost · switch-heavy bench</text>
+              <line x1="640" y1="205" x2="1080" y2="205" stroke="#333" stroke-width="1.4"/>
+              <line x1="640" y1="205" x2="640" y2="30" stroke="#999" stroke-width="1"/>
+              <g stroke="#ddd" stroke-width="1">
+                <line x1="640" y1="65" x2="1080" y2="65"/>
+                <line x1="640" y1="135" x2="1080" y2="135"/>
+              </g>
+              <text x="634" y="69" text-anchor="end" font-size="9" fill="#999">50%</text>
+              <text x="634" y="139" text-anchor="end" font-size="9" fill="#999">25%</text>
+              <!-- machine-wide median 41% : 140px = 50% -->
+              <rect x="700" y="90" width="108" height="115" fill="#111"/>
+              <text x="754" y="80" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111">+26…41 %</text>
+              <text x="754" y="222" text-anchor="middle" font-size="10.5" fill="#666">machine-wide</text>
+              <!-- filtered median 4.7% -->
+              <rect x="930" y="192" width="108" height="13" fill="url(#hatch)" stroke="#666" stroke-width="0.8"/>
+              <text x="984" y="80" text-anchor="middle" font-size="12.5" font-weight="700" fill="#111">+1.5…4.7 %</text>
+              <text x="984" y="222" text-anchor="middle" font-size="10.5" fill="#666">pid-filtered</text>
+
+              <g font-size="10" fill="#666">
+                <rect x="100" y="238" width="12" height="12" fill="#111"/>
+                <text x="118" y="248">machine-wide (all switches)</text>
+                <rect x="310" y="238" width="12" height="12" fill="url(#hatch)" stroke="#666" stroke-width="0.8"/>
+                <text x="328" y="248">pid-filtered (only listed pids)</text>
+              </g>
+            </svg>
+          </div>
+          <div class="grid2">
+            <div class="card"><h3>◉ The mitigation · PID filter</h3><p>Set <code>[bpf] filter_pids</code> and only those pids’ events reach the ring, the decode, and the history. The tracepoint still fires either way — the filter removes <b>ingest</b>, not the hook.</p></div>
+            <div class="card"><h3>◇ And the tool tests itself</h3><p>Writing the benchmark found a real bug — a PSI poller that spun because a <code>continue</code> skipped its sleep — fixed, daemon CPU went <b>1.6 → 0.6 cores</b>. The daemon’s own threads appear in its reports, measured with the same yardstick. Compute-bound control: ≈ 0 (untouched).</p></div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>12</span></div>
+      </section>
+
+      <!-- ============ 13 · TRY IT ============ -->
       <section class="slide" data-t="Try it">
         <div class="kicker">Get started</div>
         <h1 class="title">Try it in five commands</h1>
         <div class="slide-body">
           <div class="grid2" style="flex:1;">
             <div>
-              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase; margin-bottom:12px;">Quick start</div>
-              <div class="code" style="font-size:13px;">$ <span class="k">sudo</span> blackbox start          <span class="c"># daemon up, BPF attached</span>
-$ blackbox status
+              <div class="graph-cap">quick start</div>
+              <div class="code" style="font-size:13px;"><span class="k">$</span> sudo blackbox start          <span class="c"># daemon up, BPF attached</span>
+<span class="k">$</span> blackbox status
   bpf collection    attached
   events retained   12 431
-$ blackbox dump -o /tmp/inc.json
-$ blackbox report /tmp/inc.json
+<span class="k">$</span> blackbox dump -o /tmp/inc.json
+<span class="k">$</span> blackbox report /tmp/inc.json
 top cpu consumers:  swapper/3 63.7% …</div>
             </div>
             <div>
-              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase; margin-bottom:12px;">You need</div>
-              <ul class="list" style="font-size:14.5px;">
+              <div class="graph-cap">you need</div>
+              <ul class="list" style="font-size:14px;">
                 <li><b>Linux ≥ 5.15</b> (BPF ring buffers + BTF + PSI); CO-RE needs <span class="mono">/sys/kernel/btf/vmlinux</span></li>
                 <li><b>CAP_BPF + CAP_PERFMON</b> (or just root) to load BPF — reading PSI and reports need nothing special</li>
                 <li>Prebuilt <b>release tarball</b>, or build: stable Rust + nightly/rust-src + <span class="mono">bpf-linker</span> for the object</li>
-                <li>A couple of seconds: <span class="mono">sudo blackbox start</span> then <span class="mono">blackbox status</span> ← if it says “attached”, you’re recording</li>
+                <li>The whole demo is scripted: <span class="mono">scripts/demo.sh</span> end-to-end, <span class="mono">scripts/bench.sh</span> for the overhead numbers</li>
               </ul>
-              <div class="banner amber" style="margin-top:14px;"><span>🧭</span><span>No root on the demo box? BPF load is blocked (common on shared kernels) — validated in a privileged container instead; <code>--no-bpf</code> still demos PSI + dumps.</span></div>
+              <div class="banner amber" style="margin-top:14px;"><span class="ic">◉</span><span>No root on the demo box? BPF load is often blocked — validate in a privileged container; <code>--no-bpf</code> still demos PSI + dumps.</span></div>
             </div>
           </div>
         </div>
-        <div class="slide-footer"><span>Blackbox</span><span>12</span></div>
+        <div class="slide-footer"><span>Blackbox</span><span>13</span></div>
       </section>
 
-      <!-- ============ 13 · STATUS & ROADMAP ============ -->
+      <!-- ============ 14 · STATUS / PRIVACY / ROADMAP ============ -->
       <section class="slide" data-t="Status, privacy, roadmap">
         <div class="kicker">Where it stands · v0.2</div>
         <h1 class="title">Small, honest, and shaped for what’s next</h1>
         <div class="slide-body">
           <div class="grid3" style="flex:1;">
-            <div class="card"><h3>🔭 In v0.2</h3>
-              <ul class="list" style="gap:6px; font-size:13.5px;">
-                <li>sched_switch + lifecycle capture</li><li>PSI (CPU / mem / IO) + OOM + manual</li><li>bounded history, schema-v2 dump</li><li>text + Perfetto reports</li><li>PID filter · dump retention</li>
+            <div class="card"><h3>▣ In v0.2</h3>
+              <ul class="list" style="gap:5px; font-size:13px;">
+                <li>sched_switch + lifecycle capture</li>
+                <li>PSI (CPU / mem / IO) + OOM + manual</li>
+                <li>bounded history · schema-v2 dump</li>
+                <li>text + Perfetto reports · PID filter</li>
               </ul>
             </div>
-            <div class="card"><h3>🕶 Privacy posture</h3>
-              <p style="font-size:13.5px;">Records <b>pids, comms, CPU ids, timestamps</b> — and an <code>exec</code> path truncated to 15 chars. <b>No</b> arguments, no stdin/stdout, no file contents, no container names. A post-mortem of <i>scheduling</i>, nothing more.</p>
+            <div class="card"><h3>▣ Privacy posture</h3>
+              <p style="font-size:13px;">Records <b>pids, comms, CPU ids, timestamps</b> — and an <code>exec</code> path truncated to 15 chars. <b>No</b> arguments, no stdin/stdout, no file contents, no container names. A post-mortem of <i>scheduling</i>, nothing more.</p>
             </div>
-            <div class="card"><h3>🧭 Honest edges → roadmap</h3>
-              <p style="font-size:13.5px;">Window lives only while the daemon runs · kernel ring drops aren’t observable via aya (reported 0) · PID filter is coarse (pids aren’t stable) · <b>next:</b> block I/O event sources, cgroup scoping, sampling, persistent history, remote shipping.</p>
+            <div class="card"><h3>▣ Honest edges → roadmap</h3>
+              <p style="font-size:13px;">Window lives only while the daemon runs · kernel-side ring drops aren’t observable via aya (reported 0) · PID filter is coarse (pids aren’t stable) · <b>next:</b> block I/O event sources, cgroup scoping, sampling, persistent history, remote shipping.</p>
             </div>
           </div>
-          <div class="center-wrap" style="flex:none; margin-top:10px; gap:8px;">
-            <div style="font-size:20px; color:var(--muted);">The recorder is always on — <b style="color:var(--ink);">so the moment you need is never lost.</b></div>
-            <div style="font-family:var(--mono); font-size:14px; color:var(--accent);">github.com/Srujan-rai/Blackbox</div>
+          <div class="center-wrap" style="flex:none; margin-top:8px; gap:8px;">
+            <div style="font-size:20px; color:var(--muted);">The recorder is always on — <b style="color:#111;">so the moment you need is never lost.</b></div>
+            <div style="font-family:var(--mono); font-size:14px; color:#111; font-weight:700;">github.com/Srujan-rai/Blackbox</div>
             <div style="font-size:12.5px; color:var(--faint);">Rust · aya · eBPF · CO-RE · BTF — questions?</div>
           </div>
         </div>
-        <div class="slide-footer"><span>Blackbox · thank you</span><span>13</span></div>
+        <div class="slide-footer"><span>Blackbox · thank you</span><span>14</span></div>
       </section>
 
     </div>
@@ -694,7 +931,7 @@ top cpu consumers:  swapper/3 63.7% …</div>
     <!-- overlay controls (presentation mode) -->
     <div class="deckbar" id="deckbar">
       <button class="navbtn" id="b-prev" title="Previous (←)">◀</button>
-      <span class="count" id="count">1 / 13</span>
+      <span class="count" id="count">1 / 14</span>
       <button class="navbtn" id="b-next" title="Next (→)">▶</button>
       <span style="width:1px; height:18px; background:var(--line);"></span>
       <button class="navbtn" id="b-grid" title="All slides (G)">▦</button>
@@ -746,7 +983,7 @@ top cpu consumers:  swapper/3 63.7% …</div>
   var slides  = Array.prototype.slice.call(document.querySelectorAll(".slide"));
   var N = slides.length, cur = 0, gridOpen = false, helpOpen = false, fs = false, idleTimer = null;
 
-  /* ---------- sizing: fit the 1280×720 deck into the stage ---------- */
+  /* ---------- sizing: fit the 1280x720 deck into the stage ---------- */
   function fit(){
     var w = stage.clientWidth, h = stage.clientHeight;
     var s = Math.min(w / 1280, h / 720);
@@ -878,7 +1115,7 @@ top cpu consumers:  swapper/3 63.7% …</div>
 
   /* ---------- boot ---------- */
   fit(); fitThumbs();
-  var start = parseInt((location.hash || "").replace("#",""), 10) || 1;
+  var start = parseInt((location.hash || "").replace("#", ""), 10) || 1;
   show(Math.max(0, Math.min(N - 1, start - 1)));
   if (location.hash === "#g") openGrid();
 })();
