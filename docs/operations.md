@@ -89,7 +89,7 @@ Lifecycle events appear there as instant markers on each process's track.
 | A lifecycle tracepoint is not attached | Extremely rare; the daemon logs which one and keeps collecting `sched_switch`. Check the daemon log. |
 | Window much shorter than `max_seconds` | `max_events` is the binding cap; raise it. |
 | `kernel drops` shows `0` | Expected: aya does not expose ring-buffer drop counts, so the field is always zero today. Do not read it as proof of completeness — use `events_evicted` and `window.truncated` instead. |
-| `blackbox status` says the daemon is unreachable | Check the socket path it lists; a non-root daemon falls back to `/tmp/blackboxd.sock`. |
+| `blackbox status` says the daemon is unreachable | Check the socket path it lists; a non-root daemon falls back to `/tmp/blackboxd.sock`. A root-started daemon creates `/run/blackbox` and the socket itself with permissive modes (`0755` dir, `0666` socket, from v0.2.1) so the CLI works unprivileged; if a 0600-type `Permission denied` appears, a stale daemon from before v0.2.1 is listening — restart it. Sysadmins who pre-create `/run/blackbox` with a stricter mode control exactly who can reach the socket. |
 
 ## Shutdown
 

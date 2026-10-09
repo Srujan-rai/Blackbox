@@ -375,6 +375,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
 - **No network.** The daemon neither listens on nor dials a network socket; it
   speaks line-delimited JSON over a local Unix socket, one request per
   connection.
+- **The control socket is local, not private.** The daemon creates it mode
+  `0666`, so any local user can run `blackbox status` or trigger a `dump`
+  (reading scheduler metadata of similar sensitivity to `ps` output). An
+  environment that wants the socket restricted can pre-create `/run/blackbox`
+  with a stricter mode — the daemon never tightens a directory it did not
+  create.
 - **Self-describing honesty.** Dumps carry their own completeness counters, so
   a trace that lost events says so rather than looking authoritative.
 

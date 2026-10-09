@@ -20,6 +20,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -145,12 +146,22 @@ fn handle_client(
 /// that actually worked is what every later status line reports.
 fn bind_socket() -> anyhow::Result<(UnixListener, String)> {
     for path in blackbox_core::DEFAULT_SOCKET_PATHS.iter() {
+        // The CLI connects as the invoking user, not root, so the socket the
+        // daemon creates must be reachable by non-root users too:
+        // `connect(2)` on a Unix socket needs write permission on the socket
+        // file itself (and the directory must be traversable). Widen what we
+        // create — 0666 on the socket, 0755 on a runtime directory we just
+        // made. A pre-existing parent is left untouched (a sysadmin-owned
+        // /run/blackbox keeps its mode; /tmp stays 1777).
         if let Some(parent) = Path::new(path).parent() {
-            let _ = fs::create_dir_all(parent);
+            if !parent.exists() && fs::create_dir_all(parent).is_ok() {
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+            }
         }
         // A socket file left by a crashed daemon would make bind fail forever.
         let _ = fs::remove_file(path);
         if let Ok(listener) = UnixListener::bind(path) {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o666));
             return Ok((listener, (*path).to_string()));
         }
     }
