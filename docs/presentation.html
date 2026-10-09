@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blackbox — a post-mortem recorder for the Linux scheduler</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e14'/%3E%3Cpath d='M8 9h16v4H8zm0 6h10v4H8zm0 6h16v4H8z' fill='%2322d3ee'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg0:#07090f; --bg1:#0a0e15; --panel:#0e141d; --card:#111a26;
+    --line:#1c2938; --line-soft:#15202d;
+    --ink:#e6edf3; --muted:#9fb0c3; --faint:#6b7c90;
+    --accent:#22d3ee; --accent-2:#a78bfa; --warn:#fbbf24; --danger:#fb7185; --ok:#34d399;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --grad: linear-gradient(100deg, #22d3ee 0%, #60a5fa 45%, #a78bfa 100%);
+    --s: 1;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; }
+  body{
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,0.06), transparent 60%),
+      radial-gradient(1000px 500px at 0% 110%, rgba(167,139,250,0.05), transparent 60%),
+      var(--bg0);
+    color:var(--ink);
+    font-family:var(--sans);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  button{ font:inherit; color:inherit; background:none; border:none; cursor:pointer; }
+  code, pre, .mono{ font-family:var(--mono); }
+
+  /* ---------- app shell ---------- */
+  #app{ position:absolute; inset:0; display:flex; flex-direction:column; }
+
+  .topbar{
+    display:flex; align-items:center; gap:14px;
+    padding:10px 18px;
+    border-bottom:1px solid var(--line-soft);
+    background:linear-gradient(180deg, rgba(14,18,27,0.9), rgba(10,14,21,0.6));
+    backdrop-filter:blur(6px);
+    z-index:20;
+  }
+  .logo{ display:flex; align-items:center; gap:10px; font-weight:650; letter-spacing:0.4px; font-size:14px; white-space:nowrap; }
+  .logo-b{ width:20px; height:20px; border-radius:5px; background:var(--grad); position:relative; }
+  .logo-b::after{ content:""; position:absolute; inset:5px; border-radius:2px; background:var(--bg0); }
+  .sub-tag{ color:var(--faint); font-size:11px; letter-spacing:1.5px; text-transform:uppercase; }
+  .spacer{ flex:1; }
+  .btn{
+    display:inline-flex; align-items:center; gap:7px;
+    font-size:12.5px; font-weight:600; letter-spacing:0.3px;
+    color:var(--muted); padding:7px 12px; border-radius:8px;
+    border:1px solid var(--line-soft); transition:.15s;
+  }
+  .btn:hover{ color:var(--ink); border-color:var(--line); background:rgba(255,255,255,0.03); }
+  .btn.primary{ color:#06121a; background:var(--grad); border:none; }
+  .btn.primary:hover{ filter:brightness(1.08); }
+  .kbd{ font-family:var(--mono); font-size:10px; color:var(--faint); border:1px solid var(--line); border-radius:4px; padding:1px 5px; }
+
+  /* ---------- stage & deck ---------- */
+  .stage{ position:relative; flex:1; overflow:hidden; }
+  .deck{ position:absolute; left:50%; top:50%; width:1280px; height:720px;
+         transform:translate(-50%,-50%) scale(var(--s)); transform-origin:center center; }
+  .slide{
+    position:absolute; inset:0; opacity:0; visibility:hidden;
+    background:var(--bg1);
+    border:1px solid var(--line);
+    border-radius:6px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.015);
+    padding:46px 56px 52px;
+    display:flex; flex-direction:column;
+    overflow:hidden;
+  }
+  .slide.active{ opacity:1; visibility:visible; animation:rise .38s ease both; }
+  @keyframes rise{ from{ opacity:0; transform:translateY(10px); } to{ opacity:1; transform:none; } }
+
+  .kicker{
+    font-family:var(--mono); font-size:12px; letter-spacing:2.5px; text-transform:uppercase;
+    color:var(--accent); margin-bottom:14px; display:flex; align-items:center; gap:10px;
+  }
+  .kicker::before{ content:""; width:26px; height:2px; background:var(--grad); display:inline-block; }
+  h1.title{ font-size:38px; font-weight:720; letter-spacing:-0.5px; line-height:1.15; margin-bottom:10px; }
+  h2.subtitle{ font-size:19px; color:var(--muted); font-weight:450; line-height:1.45; }
+  .slide-body{ margin-top:18px; flex:1; display:flex; flex-direction:column; gap:16px; }
+
+  .slide-footer{
+    position:absolute; left:56px; right:56px; bottom:16px;
+    display:flex; justify-content:space-between; align-items:center;
+    font-family:var(--mono); font-size:10.5px; letter-spacing:2px; color:var(--faint);
+    text-transform:uppercase;
+    border-top:1px solid var(--line-soft); padding-top:10px;
+  }
+
+  /* generic content pieces */
+  .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  .grid3{ display:grid; grid-template-columns:repeat(3,1fr); gap:20px; }
+  .grid4{ display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
+  .card{
+    background:linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.005));
+    border:1px solid var(--line-soft); border-radius:10px;
+    padding:20px 22px;
+  }
+  .card h3{ font-size:16px; font-weight:650; margin-bottom:8px; display:flex; align-items:center; gap:9px; }
+  .card p{ font-size:14.5px; line-height:1.55; color:var(--muted); }
+  .num{ font-family:var(--mono); font-size:12px; color:var(--accent-2); 
+        width:26px; height:26px; border:1px solid var(--line); border-radius:7px;
+        display:inline-flex; align-items:center; justify-content:center; flex:none; }
+  ul.list{ list-style:none; display:flex; flex-direction:column; gap:11px; }
+  ul.list li{ font-size:16px; line-height:1.5; color:var(--ink); padding-left:26px; position:relative; }
+  ul.list li::before{ content:"▸"; position:absolute; left:0; color:var(--accent); }
+  ul.list li small, ul.list li .dim{ color:var(--faint); }
+  .lead{ font-size:17.5px; line-height:1.6; color:var(--muted); }
+  .lead b, .lead strong{ color:var(--ink); font-weight:650; }
+  .hl{ color:var(--accent); }
+  .hl2{ color:var(--accent-2); }
+  .warn-c{ color:var(--warn); }
+  .ok-c{ color:var(--ok); }
+  .code{
+    font-family:var(--mono); font-size:13px; line-height:1.65; color:#d7e3ee;
+    background:#0a0f16; border:1px solid var(--line-soft); border-radius:10px;
+    padding:16px 18px; overflow:hidden; white-space:pre;
+  }
+  .code .c{ color:var(--faint); } .code .k{ color:var(--accent-2); } .code .s{ color:var(--ok); }
+  .stat-row{ display:flex; gap:16px; flex-wrap:wrap; }
+  .stat{
+    flex:1; min-width:180px; background:var(--card); border:1px solid var(--line-soft);
+    border-radius:10px; padding:18px 20px;
+  }
+  .stat .big{ font-size:34px; font-weight:750; font-family:var(--mono); letter-spacing:-1px; }
+  .stat .lbl{ font-size:12px; color:var(--faint); letter-spacing:1.2px; text-transform:uppercase; margin-top:6px; }
+  .stat .sub{ font-size:12.5px; color:var(--muted); margin-top:5px; line-height:1.5; }
+
+  /* architecture diagram */
+  .arch{ display:flex; flex-direction:column; gap:10px; font-size:13.5px; }
+  .arch-row{ display:flex; align-items:stretch; gap:10px; }
+  .arch-box{
+    flex:1; background:var(--card); border:1px solid var(--line); border-radius:8px;
+    padding:11px 14px;
+  }
+  .arch-box .be{ font-family:var(--mono); font-size:12px; color:var(--accent); letter-spacing:0.6px; }
+  .arch-box .de{ font-size:12px; color:var(--muted); margin-top:3px; line-height:1.4; }
+  .arch-box.hot{ border-color:rgba(34,211,238,0.5); }
+  .arch-box.usr{ border-color:rgba(167,139,250,0.45); }
+  .arrow{ display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--faint); font-size:11px; gap:2px; min-width:96px;}
+  .arrow .t{ font-family:var(--mono); font-size:10.5px; color:var(--faint); letter-spacing:0.8px;}
+  .arrow .i{ font-size:15px; color:var(--accent); }
+
+  /* timeline (problem slide) */
+  .timeline{ display:flex; align-items:center; height:88px; position:relative;
+             background:linear-gradient(180deg, rgba(34,211,238,0.05), transparent);
+             border:1px solid var(--line-soft); border-radius:10px; padding:0 16px; }
+  .tl{ position:relative; height:8px; background:linear-gradient(90deg,#1a2938,#1a2938); border-radius:4px; flex:1; }
+  .tl .spark{ position:absolute; top:-11px; width:26px; height:26px; border-radius:50%;
+               background:rgba(251,191,36,0.16); border:2px solid var(--warn); }
+  .tl .boom{ position:absolute; top:-14px; width:34px; height:34px; border-radius:50%;
+             background:rgba(251,113,133,0.2); border:2px solid var(--danger); }
+  .tl .now{ position:absolute; top:-2px; width:3px; height:12px; background:var(--faint); }
+  .tl-label{ font-family:var(--mono); font-size:10.5px; color:var(--faint); letter-spacing:1px; position:absolute; }
+  .bracket{ position:absolute; left:6%; right:36%; top:-26px; height:6px; border:1px dashed var(--accent);
+            border-bottom:none; margin-top:-5px; }
+  .bracket-label{ position:absolute; left:6%; right:50%; top:-50px; font-size:11.5px; color:var(--accent);
+                  font-family:var(--mono); letter-spacing:1px; }
+
+  /* record strip (slide 5) */
+  .rec{ display:flex; margin-top:6px; }
+  .rec .f{ border-right:1px solid var(--line); padding:0 10px; text-align:center;
+            font-family:var(--mono); display:flex; flex-direction:column; justify-content:center;
+            background:linear-gradient(180deg, rgba(34,211,238,0.05), transparent); }
+  .rec .f:first-child{ border-radius:8px 0 0 8px; }
+  .rec .f:last-child{ border:none; border-radius:0 8px 8px 0; }
+  .rec .f .n{ font-size:11px; color:var(--accent); }
+  .rec .f .t{ font-size:11.5px; color:var(--ink); margin-top:4px; white-space:nowrap; }
+  .rec .f .o{ font-size:9.5px; color:var(--faint); margin-top:3px; font-family:var(--mono); }
+
+  /* trigger cards */
+  .trig{ display:flex; flex-direction:column; gap:13px; }
+  .trig .row{ display:flex; align-items:flex-start; gap:13px; }
+  .trig .ico{ width:34px; height:34px; border-radius:9px; display:flex; align-items:center; justify-content:center;
+              font-size:16px; flex:none; border:1px solid var(--line); background:var(--card); }
+  .trig .row b{ font-size:15.5px; }
+  .trig .row p{ font-size:13px; color:var(--muted); line-height:1.5; margin-top:3px; }
+  .tag{ font-family:var(--mono); font-size:10.5px; color:var(--accent); border:1px solid rgba(34,211,238,0.35);
+        background:rgba(34,211,238,0.07); border-radius:20px; padding:2px 9px; letter-spacing:0.5px; }
+  .tag.gray{ color:var(--muted); border-color:var(--line); background:transparent; }
+
+  .big-quote{ font-size:27px; font-weight:650; line-height:1.35; letter-spacing:-0.3px; }
+  .big-quote .em{ background:linear-gradient(100deg, var(--accent), var(--accent-2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+
+  .banner{ display:flex; align-items:center; gap:12px; border:1px solid rgba(34,211,238,0.3);
+           background:rgba(34,211,238,0.06); border-radius:10px; padding:14px 18px; font-size:15.5px; }
+  .banner.amber{ border-color:rgba(251,191,36,0.4); background:rgba(251,191,36,0.07); }
+  .banner.red{ border-color:rgba(251,113,133,0.4); background:rgba(251,113,133,0.07); }
+
+  .center-wrap{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; }
+
+  /* ---------- chrome overlays (presentation mode) ---------- */
+  .deckbar{
+    position:absolute; left:50%; bottom:14px; transform:translateX(-50%);
+    display:flex; align-items:center; gap:12px;
+    background:rgba(7,9,15,0.82); border:1px solid var(--line); border-radius:12px;
+    padding:8px 14px; z-index:30; backdrop-filter:blur(8px);
+    opacity:0; transition:opacity .25s; pointer-events:none;
+  }
+  .deckbar.show{ opacity:1; pointer-events:auto; }
+  .deckbar .count{ font-family:var(--mono); font-size:12px; color:var(--muted); letter-spacing:1px; white-space:nowrap; }
+  .navbtn{ width:30px; height:30px; border-radius:8px; border:1px solid var(--line);
+           display:inline-flex; align-items:center; justify-content:center; font-size:14px; color:var(--muted);
+           transition:.15s; }
+  .navbtn:hover{ color:var(--ink); border-color:var(--accent); }
+
+  #progress{ position:fixed; left:0; bottom:0; height:3px; width:0%;
+             background:linear-gradient(90deg, var(--accent), var(--accent-2)); z-index:40; transition:width .25s; }
+
+  /* ---------- grid / overview ---------- */
+  #grid{
+    position:fixed; inset:0; z-index:50;
+    background:var(--bg0); overflow:auto;
+    display:none; padding:46px 40px 80px;
+  }
+  #grid.open{ display:block; }
+  .grid-head{ display:flex; align-items:baseline; gap:14px; margin-bottom:26px; }
+  .grid-head h2{ font-size:22px; font-weight:700; letter-spacing:-0.3px; }
+  .grid-head span{ color:var(--faint); font-size:13px; }
+  .grid-cards{ display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:24px; }
+  .tcard{ border-radius:12px; overflow:hidden; border:1px solid var(--line-soft); background:var(--bg1);
+          cursor:pointer; transition:.15s; position:relative; }
+  .tcard:hover{ border-color:var(--accent); transform:translateY(-2px); }
+  .tcard .view{ aspect-ratio:16/9; overflow:hidden; position:relative; background:#05070c; }
+  .tcard .sub{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 12px; }
+  .tcard .sub .t{ font-size:12.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tcard .sub .im{ font-family:var(--mono); font-size:11px; color:var(--faint); }
+  .tcard .play{ position:absolute; right:8px; top:8px; width:32px; height:32px; border-radius:9px;
+                background:rgba(7,9,15,0.75); border:1px solid var(--line); color:var(--accent);
+                font-size:14px; display:flex; align-items:center; justify-content:center; z-index:4;
+                opacity:0; transition:.15s; }
+  .tcard:hover .play{ opacity:1; }
+  .tcard .play:hover{ border-color:var(--accent); background:var(--accent); color:#06121a; }
+
+  /* help modal */
+  #help{ position:fixed; inset:0; z-index:60; display:none; align-items:center; justify-content:center;
+         background:rgba(7,9,15,0.78); backdrop-filter:blur(4px); }
+  #help.open{ display:flex; }
+  .help-box{ background:var(--bg1); border:1px solid var(--line); border-radius:14px; padding:28px 30px; width:560px; max-width:92vw; }
+  .help-box h3{ font-size:17px; margin-bottom:16px; }
+  .help-grid{ display:grid; grid-template-columns:1fr 1fr; gap:8px 22px; }
+  .help-grid .r{ display:flex; justify-content:space-between; align-items:center; font-size:13.5px; color:var(--muted); padding:5px 0; border-bottom:1px dashed var(--line-soft); }
+  .help-grid .r .k{ font-family:var(--mono); font-size:11px; color:var(--ink); border:1px solid var(--line); border-radius:5px; padding:2px 7px; }
+
+  /* icons row on title slide */
+  .chip{ display:inline-flex; align-items:center; gap:8px; font-size:13.5px; color:var(--muted);
+         border:1px solid var(--line); border-radius:30px; padding:8px 16px; }
+  .chip b{ color:var(--ink); }
+
+  #app:fullscreen{ background:#000; }
+  #app:fullscreen .topbar{ display:none; }
+  #app:fullscreen .stage{ }
+
+  @media (max-width: 900px){
+    .topbar .sub-tag{ display:none; }
+    .grid-cards{ grid-template-columns:repeat(auto-fill, minmax(240px,1fr)); }
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{ animation:none !important; transition:none !important; }
+  }
+  @media print{
+    body{ overflow:visible; background:#fff; }
+    #app, .stage{ position:static; display:block; }
+    .topbar, .deckbar, #progress, #grid, #help{ display:none !important; }
+    .deck{ transform:none !important; position:static; width:100%; }
+    .slide{ position:static; opacity:1; visibility:visible; page-break-after:always; }
+  }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- top chrome -->
+  <div class="topbar">
+    <div class="logo">
+      <span class="logo-b"></span>
+      <span>Blackbox</span>
+      <span class="sub-tag">eBPF·Scheduler·Post-mortem</span>
+    </div>
+    <div class="spacer"></div>
+    <button class="btn" id="btn-grid">▦ &nbsp;All slides</button>
+    <button class="btn primary" id="btn-fs">⛶ &nbsp;Present</button>
+    <button class="btn" id="btn-help">?</button>
+  </div>
+
+  <!-- stage -->
+  <div class="stage">
+    <div class="deck" id="deck">
+
+      <!-- ============ 1 · TITLE ============ -->
+      <section class="slide" data-t="Blackbox: eBPF post-mortem recorder">
+        <div class="center-wrap" style="gap:26px;">
+          <div style="display:flex; gap:10px; justify-content:center;">
+            <span class="tag">RUST</span><span class="tag">eBPF / aya</span><span class="tag">CO-RE · BTF</span><span class="tag gray">LINUX ≥ 5.15</span>
+          </div>
+          <div>
+            <div style="font-family:var(--mono); font-size:15px; letter-spacing:8px; color:var(--faint); text-transform:uppercase; margin-bottom:14px;">A post-mortem recorder for the Linux scheduler</div>
+            <div style="font-size:96px; font-weight:800; letter-spacing:-3px; line-height:1; background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent;">BLACKBOX</div>
+            <div style="font-size:21px; color:var(--muted); margin-top:22px; line-height:1.5;">
+              The half-second <b style="color:var(--ink);">before</b> a machine stalls —<br>captured always-on, explained one dump away.
+            </div>
+          </div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; justify-content:center;">
+            <span class="chip">⟲ <b>sched_switch</b> + lifecycle</span>
+            <span class="chip">⚠ <b>PSI</b> + OOM triggers</span>
+            <span class="chip">⇩ text + <b>Perfetto</b> reports</span>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox · v0.2</span><span>1</span></div>
+      </section>
+
+      <!-- ============ 2 · PROBLEM ============ -->
+      <section class="slide" data-t="The problem: the moment is gone">
+        <div class="kicker">Why</div>
+        <h1 class="title">The interesting part happens <span class="em" style="background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent;">before you notice</span></h1>
+        <div class="slide-body">
+          <div class="grid2" style="flex:1;">
+            <div style="display:flex; flex-direction:column; gap:18px; justify-content:center;">
+              <div class="big-quote" style="font-size:22px; line-height:1.5;">When a machine stalls, the question is: <span class="em">“which tasks were runnable and couldn’t get a CPU?”</span></div>
+              <ul class="list" style="font-size:15.5px;">
+                <li>By the time you attach <code>perf</code>, the window you needed has <b>already slid past</b>.</li>
+                <li>Who was holding the CPU? What was stuck on I/O? <b>Unanswerable after the fact.</b></li>
+                <li>Servers go through seconds of complete unresponsiveness — and nobody kept the tape.</li>
+              </ul>
+              <div class="banner" style="margin-top:4px;">
+                <span style="font-size:18px;">🎯</span>
+                <span><b>Blackbox is always running</b>, so the history is already there when the stall happens.</span>
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:28px; justify-content:center;">
+              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase;">What today looks like</div>
+              <div class="timeline">
+                <div class="bracket"></div>
+                <span class="bracket-label">the half-second that matters — already gone</span>
+                <div class="tl">
+                  <span class="tl-label" style="left:2%; bottom:-22px;">normal</span>
+                  <span class="tl-label" style="left:48%; bottom:-22px;">spike</span>
+                  <span class="spark" style="left:55%;"></span>
+                  <span class="tl-label" style="left:74%; top:-20px; color:var(--danger);">stall</span>
+                  <span class="boom" style="left:78%;"></span>
+                  <span class="now" style="left:92%;"></span>
+                </div>
+              </div>
+              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase;">What blackbox keeps</div>
+              <div class="code" style="font-size:12.5px;"><span class="c"># last 30 s / 250k events, always on</span>
+<span class="k">$</span> blackbox dump -o incident.json
+<span class="k">$</span> blackbox report incident.json
+top cpu consumers:  swapper/3 63.7% · bpf-collector 6.4% …
+longest sched delay: 2.0 ms — <span class="s">reproduced after the fact</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>2</span></div>
+      </section>
+
+      <!-- ============ 3 · WHAT IT DOES ============ -->
+      <section class="slide" data-t="What it does">
+        <div class="kicker">What it does</div>
+        <h1 class="title">A tiny tape recorder strapped to the scheduler</h1>
+        <div class="slide-body">
+          <p class="lead">Four moves, nothing more — and each one is deliberately small.</p>
+          <div class="grid4">
+            <div class="card"><h3><span class="num">1</span>Capture</h3><p>Watches <b>sched_switch</b> through one tracepoint (no kprobes), plus <b>fork / exec / exit</b> lifecycle events on their own stream.</p></div>
+            <div class="card"><h3><span class="num">2</span>Retain</h3><p>Keeps a rolling <b>last-N window</b> in userspace — capped by both event count and seconds, so memory is predictable.</p></div>
+            <div class="card"><h3><span class="num">3</span>Trigger</h3><p>Writes a trace the moment <b>PSI pressure</b> (CPU / memory / I/O) or an <b>OOM kill</b> crosses a threshold — or when you ask.</p></div>
+            <div class="card"><h3><span class="num">4</span>Export</h3><p>One self-describing JSON dump → <b>plain-text report</b> or a <b>Perfetto</b> timeline you drag into ui.perfetto.dev.</p></div>
+          </div>
+          <div class="banner" style="margin-top:6px;">
+            <span style="font-size:18px;">🧠</span>
+            <span>All of the hard logic — intervals, ranking, hysteresis — is <b>pure user-space Rust</b>. The BPF side only stamps and copies 64-byte records.</span>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>3</span></div>
+      </section>
+
+      <!-- ============ 4 · ARCHITECTURE ============ -->
+      <section class="slide" data-t="How it works">
+        <div class="kicker">How it works</div>
+        <h1 class="title">Kernel stamps, userspace thinks</h1>
+        <div class="slide-body">
+          <div class="arch">
+            <div class="arch-row">
+              <div class="arch-box hot"><div class="be">sched/sched_switch · tracepoint</div><div class="de">no kprobe · adds cpu id · copies 64 B</div></div>
+              <div class="arrow"><span class="t">8 MB ring</span><span class="i">→</span></div>
+              <div class="arch-box hot"><div class="be">EVENTS ringbuf</div><div class="de">64-byte records · never tags branches</div></div>
+              <div class="arrow"><span class="t">decode</span><span class="i">→</span></div>
+              <div class="arch-box usr"><div class="be">HistoryRing (userspace)</div><div class="de">bounded VecDeque · last N s / count</div></div>
+            </div>
+            <div class="arch-row">
+              <div class="arch-box hot"><div class="be">sched_process_ fork · exec · exit</div><div class="de">best-effort attach · their own stream</div></div>
+              <div class="arrow"><span class="t">512 KB</span><span class="i">→</span></div>
+              <div class="arch-box hot"><div class="be">LIFECYCLE ringbuf</div><div class="de">fork / exec / exit · exec path ≤15 chars</div></div>
+              <div class="arrow"><span class="t">decode</span><span class="i">→</span></div>
+              <div class="arch-box usr"><div class="be">LifecycleRing</div><div class="de">instant markers alongside the trace</div></div>
+            </div>
+            <div class="arch-row">
+              <div class="arch-box"><div class="be">/proc/pressure · /proc/vmstat</div><div class="de">polled every 250 ms · zero BPF</div></div>
+              <div class="arrow"><span class="t">hysteresis</span><span class="i">→</span></div>
+              <div class="arch-box usr"><div class="be">Trigger poller → PressureMonitor / OomMonitor</div><div class="de">fires once, re-arms when pressure recedes</div></div>
+              <div class="arrow"><span class="t">fire</span><span class="i">→</span></div>
+              <div class="arch-box usr"><div class="be">Dump writer</div><div class="de">JSON schema v2 · host meta · window bounds</div></div>
+            </div>
+            <div class="arch-row">
+              <div class="arch-box"><div class="be">blackbox CLI · start / status / dump</div><div class="de">Unix socket · status · manual dump · retention</div></div>
+              <div class="arrow"><span class="t">IPC</span><span class="i">→</span></div>
+              <div class="arch-box usr"><div class="be">blackboxd · 3 threads, one locked Runtime</div><div class="de">collect · trigger-poll · IPC — shared state</div></div>
+              <div class="arrow"><span class="t">report</span><span class="i">→</span></div>
+              <div class="arch-box usr"><div class="be">Text report / Perfetto JSON</div><div class="de">offline · no privileges needed</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>4</span></div>
+      </section>
+
+      <!-- ============ 5 · BPF HALF ============ -->
+      <section class="slide" data-t="The BPF half, deliberately minimal">
+        <div class="kicker">Inside the object</div>
+        <h1 class="title">The BPF half is deliberately dumb</h1>
+        <div class="slide-body">
+          <div class="stat-row">
+            <div class="stat"><div class="big">1</div><div class="lbl">tracepoint · no kprobes</div><div class="sub">sched_switch only on the hot path — lifecycle events get their own programs</div></div>
+            <div class="stat"><div class="big">64 B</div><div class="lbl">fixed record size</div><div class="sub">one decode path, one wire layout; truncated records are dropped, never misread</div></div>
+            <div class="stat"><div class="big">2</div><div class="lbl">independent ring buffers</div><div class="sub">a fork storm can never perturb the switch hot path or its layout</div></div>
+            <div class="stat"><div class="big">CO-RE</div><div class="lbl">BTF, kernel ≥ 5.15</div><div class="sub">one prebuilt object runs across compatible kernels</div></div>
+          </div>
+          <div class="grid2" style="margin-top:4px;">
+            <div style="display:flex; flex-direction:column; gap:9px; justify-content:center;">
+              <ul class="list" style="font-size:15px;">
+                <li>It <b>stamps the CPU id</b> (not in the tracepoint payload) and copies records. That’s it.</li>
+                <li>Verifier-friendly: bounded loops, no unbounded helpers, licence declared <span class="mono" style="font-size:12.5px;">Dual MIT/GPL</span> for the kernel’s GPL-only helpers.</li>
+                <li>Userspace rejects a record that isn’t exactly 64 bytes — <b>no silent misparse</b>.</li>
+              </ul>
+            </div>
+            <div>
+              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase; margin-bottom:12px;">sched_switch record · 64 bytes</div>
+              <div class="rec">
+                <div class="f" style="flex:2;"><span class="n">ts_ns · u64</span><span class="o">0</span></div>
+                <div class="f" style="flex:2;"><span class="n">prev_state · i64</span><span class="o">8</span></div>
+                <div class="f" style="flex:1;"><span class="n">prev_pid</span><span class="o">16</span></div>
+                <div class="f" style="flex:1;"><span class="n">next_pid</span><span class="o">20</span></div>
+                <div class="f" style="flex:1;"><span class="n">cpu</span><span class="o">24</span></div>
+                <div class="f" style="flex:2;"><span class="n">prev_comm[16]</span><span class="o">28</span></div>
+                <div class="f" style="flex:2;"><span class="n">next_comm[16]</span><span class="o">44</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>5</span></div>
+      </section>
+
+      <!-- ============ 6 · DESIGN DECISIONS ============ -->
+      <section class="slide" data-t="Two design decisions">
+        <div class="kicker">Design</div>
+        <h1 class="title">Two decisions most of the architecture follows from</h1>
+        <div class="slide-body">
+          <div class="grid2" style="flex:1;">
+            <div class="card" style="display:flex; flex-direction:column; gap:10px;">
+              <h3><span class="num" style="color:var(--accent); border-color:rgba(34,211,238,.4);">1</span>The ring buffer is transport only — <b>history lives in user space</b></h3>
+              <p>A BPF ring buffer cannot retain history: it overwrites the oldest unread records. So the real “last N seconds” is a bounded <code>VecDeque</code> in <code>blackbox-core</code>, refilled continuously.</p>
+              <div class="banner red" style="margin-top:auto;">
+                <span>⚠</span><span>Honest consequence: history exists only while <b>blackboxd is running</b>. A killed daemon leaves a short window.</span>
+              </div>
+            </div>
+            <div class="card" style="display:flex; flex-direction:column; gap:10px;">
+              <h3><span class="num" style="color:var(--accent-2); border-color:rgba(167,139,250,.4);">2</span>All the hard logic is <b>pure, testable Rust</b></h3>
+              <p>Interval reconstruction, ranking consumers, PSI hysteresis, report formatting — everything that costs verifier budget and runtime sits in <code>blackbox-core</code>, which runs with no privileges.</p>
+              <div class="banner" style="margin-top:auto;">
+                <span>🧪</span><span>That split is why the whole brain of the tool is covered by ordinary <code>cargo test</code> — 180 tests, zero root.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>6</span></div>
+      </section>
+
+      <!-- ============ 7 · READING THE TRACE ============ -->
+      <section class="slide" data-t="Reading the trace">
+        <div class="kicker">Reconstruction</div>
+        <h1 class="title">Switches in, answers out</h1>
+        <div class="slide-body">
+          <div class="grid2" style="flex:1;">
+            <ul class="list" style="justify-content:center;">
+              <li>Consecutive switches on a CPU are <b>rebuilt into on-CPU intervals</b> — who actually held each core, for how long.</li>
+              <li><b>prev_state</b> separates the two failure modes:
+                <div style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
+                  <div class="banner" style="padding:10px 14px; font-size:13.5px;"><span>⚡</span><span><b>prev_state = 0</b> → task was runnable and lost the CPU → <b>scheduler latency</b> (→ longest-delay ranking)</span></div>
+                  <div class="banner amber" style="padding:10px 14px; font-size:13.5px;"><span>💤</span><span><b>prev_state ≠ 0</b> → task slept / waited on I/O → <b>blocked time</b></span></div>
+                </div>
+              </li>
+              <li>Lifecycle events ride their own stream and render as <b>instant markers</b> — a fork storm or a respawning daemon shows up next to the CPU picture.</li>
+            </ul>
+            <div style="display:flex; flex-direction:column; gap:12px; justify-content:center;">
+              <div class="code" style="font-size:12.5px;"><span class="c"># longest scheduler delays</span>
+   2.0 ms  pid 0     swapper/3
+   1.8 ms  pid 69434 dav1d-worker
+   1.4 ms  pid 72208 trigger-poller</div>
+              <div class="code" style="font-size:12.5px;"><span class="c"># top cpu consumers (from the same trace)</span>
+  63.72%  swapper/3     2.56 s
+  10.91%  trigger-poller 438.9 ms
+   6.38%  bpf-collector 256.5 ms
+   3.88%  gnome-terminal- 155.9 ms</div>
+              <p style="font-size:12.5px; color:var(--faint); line-height:1.55;">Note the daemon measuring itself — <code>trigger-poller</code> and <code>bpf-collector</code> appear in the ranking. That’s honesty by construction.</p>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>7</span></div>
+      </section>
+
+      <!-- ============ 8 · TRIGGERS ============ -->
+      <section class="slide" data-t="Triggers">
+        <div class="kicker">Triggers</div>
+        <h1 class="title">The dump fires itself — with hysteresis</h1>
+        <div class="slide-body">
+          <div class="grid2" style="flex:1;">
+            <div class="trig">
+              <div class="row"><div class="ico">🧠</div><div><b>CPU pressure</b> <span class="tag" style="margin-left:6px;">PSI /proc/pressure/cpu</span><p>avg10 over threshold &nbsp;·&nbsp; default 80%</p></div></div>
+              <div class="row"><div class="ico">🧮</div><div><b>Memory pressure</b> <span class="tag" style="margin-left:6px;">PSI</span><p>runnable-or-blocked-on-memory skew · default 20%</p></div></div>
+              <div class="row"><div class="ico">💾</div><div><b>I/O pressure</b> <span class="tag" style="margin-left:6px;">PSI</span><p>tasks stalled on I/O · default 20%</p></div></div>
+              <div class="row"><div class="ico">☠️</div><div><b>OOM kill</b> <span class="tag" style="margin-left:6px;">/proc/vmstat</span><p>any advance of the <code>oom_kill</code> counter fires — needs no BPF, reports the kill count</p></div></div>
+              <div class="row"><div class="ico">✋</div><div><b>Manual</b> <span class="tag" style="margin-left:6px;">blackbox dump</span><p>take the trace now, whenever you want</p></div></div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:16px; justify-content:center;">
+              <div class="card"><h3>Hysteresis — no dump storms</h3>
+                <p>A trigger must stay over threshold for <code>consecutive</code> samples (default 4 × 250 ms) before firing, and it <b>re-arms only once pressure recedes</b> below the threshold. A sustained stall dumps once, not forty times.</p>
+                <div style="display:flex; gap:8px; margin-top:14px; align-items:center; font-family:var(--mono); font-size:11px; color:var(--faint);">
+                  <span style="color:var(--muted);">over</span><span class="tag">×4</span><span style="color:var(--muted);">→</span><span style="color:var(--warn);">fire ✓</span><span style="color:var(--muted);">· recedes →</span><span style="color:var(--accent);">re-arm</span>
+                </div>
+              </div>
+              <div class="card"><h3>Every dump is self-describing</h3>
+                <p>Schema version, trigger reason + time, host identity, window bounds (monotonic <i>and</i> wall-clock), and the daemon’s own overhead counters ride along with the events.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>8</span></div>
+      </section>
+
+      <!-- ============ 9 · DUMP & REPORTS ============ -->
+      <section class="slide" data-t="Dump & reports">
+        <div class="kicker">After it fires</div>
+        <h1 class="title">One trace, two ways to read it</h1>
+        <div class="slide-body">
+          <div class="grid2" style="flex:1;">
+            <div style="display:flex; flex-direction:column; gap:12px;">
+              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase;">The dump · JSON schema v2</div>
+              <div class="code" style="font-size:12px; flex:1;">{
+  <span class="s">"schema"</span>: 2,          <span class="c">// v1 traces still load</span>
+  <span class="s">"trigger"</span>: { <span class="s">"reason"</span>: <span class="s">"psi_cpu"</span>, … },
+  <span class="s">"host"</span>: { <span class="s">"hostname"</span>: …, <span class="s">"os"</span>: …, <span class="s">"kernel"</span>: … },
+  <span class="s">"window"</span>: { <span class="s">"start_mono_ns"</span>: …,
+              <span class="s">"start_wall_utc"</span>: …, <span class="s">"end"</span>: …,
+              <span class="s">"truncated"</span>: false },
+  <span class="s">"events"</span>: [ 64-byte sched_switch … ],
+  <span class="s">"lifecycle"</span>: [ fork / exec / exit … ]
+}</div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:12px;">
+              <div class="card"><h3>📄 Text report · <code>blackbox report f.json</code></h3>
+                <ul class="list" style="gap:7px; font-size:14px;">
+                  <li>Top CPU consumers, per CPU or whole-host</li>
+                  <li>Longest scheduler delays — runnable tasks waiting on a CPU</li>
+                  <li>Most blocked time; lifecycle section; <code>--top N</code></li>
+                </ul>
+              </div>
+              <div class="card"><h3>📈 Perfetto · <code>blackbox report --perfetto</code></h3>
+                <p>Chrome-format JSON you drag straight onto <b>ui.perfetto.dev</b>: per-CPU scheduling lanes, blocked/sleep states, and lifecycle instant markers.</p>
+                <div class="code" style="margin-top:10px; font-size:12px;">$ blackbox report incident.json --perfetto &gt; t.json
+<span class="c"># → drag t.json onto ui.perfetto.dev</span></div>
+              </div>
+              <div class="banner" style="margin-top:auto;"><span>🔒</span><span>Runs offline and unprivileged — the exporter is pure Rust, no daemon needed to re-read a dump.</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>9</span></div>
+      </section>
+
+      <!-- ============ 10 · CLI ============ -->
+      <section class="slide" data-t="CLI and lifecycle">
+        <div class="kicker">Operations</div>
+        <h1 class="title">Four commands in, clean lifecycle out</h1>
+        <div class="slide-body">
+          <div class="code" style="font-size:14px;">$ sudo blackbox start        <span class="c"># detached daemon · --foreground for services</span>
+$ blackbox status             <span class="c"># health · collection · last trigger</span>
+$ blackbox dump -o inc.json   <span class="c"># manual trace NOW</span>
+$ blackbox report inc.json    <span class="c"># text …</span>
+$ blackbox report inc.json --perfetto &gt; t.json   <span class="c"># …or Perfetto</span></div>
+          <div class="grid3" style="margin-top:6px;">
+            <div class="card"><h3>🛰 Daemon + CLI</h3><p>Line-delimited JSON over a <b>Unix socket</b>; three threads (collect · trigger-poll · IPC) share one locked <code>Runtime</code>.</p></div>
+            <div class="card"><h3>🪂 Graceful degradation</h3><p>No object / no privileges / no BTF? BPF stays off, <b>PSI + OOM dumps and <code>status</code> keep working</b> — and status says exactly why.</p></div>
+            <div class="card"><h3>🧹 Clean shutdown</h3><p><code>SIGINT</code>/<code>SIGTERM</code> stop both workers in a few hundred ms, remove socket + pidfile; dump retention keeps the newest <code>K</code>; systemd unit included.</p></div>
+          </div>
+          <div class="grid2" style="margin-top:6px;">
+            <div class="banner amber"><span>🎚</span><span><b>Config</b> — <code>history</code>, <code>pressure</code>, <code>dump</code>, <code>bpf</code> sections. Missing file = defaults; unknown key = hard startup error.</span></div>
+            <div class="banner"><span>🎯</span><span><b>PID filter</b> — <code>[bpf] filter_pids</code> narrows machine-wide tracing to a few processes (more on the next slide).</span></div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>10</span></div>
+      </section>
+
+      <!-- ============ 11 · OVERHEAD ============ -->
+      <section class="slide" data-t="Overhead, measured honestly">
+        <div class="kicker">Cost</div>
+        <h1 class="title">It reads every switch — so it is not free</h1>
+        <div class="slide-body">
+          <p class="lead" style="font-size:15.5px;">Cost scales with the <b>machine-wide context-switch rate</b>, not CPU load. Measured on an 8-core host running a switch-only workload (400k switches / run):</p>
+          <div class="stat-row">
+            <div class="stat"><div class="big">+26–63%</div><div class="lbl">switch-heavy workload</div><div class="sub">noisy shared host — treat as indicative · ~0.6–1.7 µs per switch caused</div></div>
+            <div class="stat"><div class="big">~0.6</div><div class="lbl">core, daemon CPU</div><div class="sub">the stable figure across runs · lifecycle tracepoints add nothing measurable</div></div>
+            <div class="stat"><div class="big">≈ 0</div><div class="lbl">compute-bound workload</div><div class="sub">blackbox runs no code on compute — the control is untouched</div></div>
+          </div>
+          <div class="grid2" style="margin-top:6px;">
+            <div class="card"><h3>🎯 The mitigation: PID filter</h3><p>Set <code>[bpf] filter_pids</code> and only those pids’ events reach the ring, the decode and the history.</p>
+              <div class="stat-row" style="margin-top:12px;">
+                <div class="stat"><div class="big">66% → 0.15%</div><div class="lbl">daemon CPU (one core)</div></div>
+                <div class="stat"><div class="big">+26–41% → +1.5–4.7%</div><div class="lbl">workload cost</div></div>
+              </div>
+              <p style="font-size:12.5px; color:var(--faint); margin-top:10px;">The tracepoint still fires either way — the filter removes the <b>ingest</b>, not the hook.</p>
+            </div>
+            <div class="card"><h3>🧪 And the tool tests itself</h3><p>Writing the benchmark found a real bug — a PSI poller that spun because a <code>continue</code> skipped its sleep — and fixing it cut daemon CPU from <b>1.6 → 0.6 cores</b>. The daemon’s own threads show up in its reports, measured with the same yardstick.</p>
+              <div class="code" style="margin-top:10px; font-size:12px;">$ sudo scripts/bench.sh
+$ sudo FILTER_PIDS=999999 scripts/bench.sh</div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>11</span></div>
+      </section>
+
+      <!-- ============ 12 · TRY IT ============ -->
+      <section class="slide" data-t="Try it">
+        <div class="kicker">Get started</div>
+        <h1 class="title">Try it in five commands</h1>
+        <div class="slide-body">
+          <div class="grid2" style="flex:1;">
+            <div>
+              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase; margin-bottom:12px;">Quick start</div>
+              <div class="code" style="font-size:13px;">$ <span class="k">sudo</span> blackbox start          <span class="c"># daemon up, BPF attached</span>
+$ blackbox status
+  bpf collection    attached
+  events retained   12 431
+$ blackbox dump -o /tmp/inc.json
+$ blackbox report /tmp/inc.json
+top cpu consumers:  swapper/3 63.7% …</div>
+            </div>
+            <div>
+              <div style="font-family:var(--mono); font-size:11.5px; letter-spacing:2px; color:var(--faint); text-transform:uppercase; margin-bottom:12px;">You need</div>
+              <ul class="list" style="font-size:14.5px;">
+                <li><b>Linux ≥ 5.15</b> (BPF ring buffers + BTF + PSI); CO-RE needs <span class="mono">/sys/kernel/btf/vmlinux</span></li>
+                <li><b>CAP_BPF + CAP_PERFMON</b> (or just root) to load BPF — reading PSI and reports need nothing special</li>
+                <li>Prebuilt <b>release tarball</b>, or build: stable Rust + nightly/rust-src + <span class="mono">bpf-linker</span> for the object</li>
+                <li>A couple of seconds: <span class="mono">sudo blackbox start</span> then <span class="mono">blackbox status</span> ← if it says “attached”, you’re recording</li>
+              </ul>
+              <div class="banner amber" style="margin-top:14px;"><span>🧭</span><span>No root on the demo box? BPF load is blocked (common on shared kernels) — validated in a privileged container instead; <code>--no-bpf</code> still demos PSI + dumps.</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox</span><span>12</span></div>
+      </section>
+
+      <!-- ============ 13 · STATUS & ROADMAP ============ -->
+      <section class="slide" data-t="Status, privacy, roadmap">
+        <div class="kicker">Where it stands · v0.2</div>
+        <h1 class="title">Small, honest, and shaped for what’s next</h1>
+        <div class="slide-body">
+          <div class="grid3" style="flex:1;">
+            <div class="card"><h3>🔭 In v0.2</h3>
+              <ul class="list" style="gap:6px; font-size:13.5px;">
+                <li>sched_switch + lifecycle capture</li><li>PSI (CPU / mem / IO) + OOM + manual</li><li>bounded history, schema-v2 dump</li><li>text + Perfetto reports</li><li>PID filter · dump retention</li>
+              </ul>
+            </div>
+            <div class="card"><h3>🕶 Privacy posture</h3>
+              <p style="font-size:13.5px;">Records <b>pids, comms, CPU ids, timestamps</b> — and an <code>exec</code> path truncated to 15 chars. <b>No</b> arguments, no stdin/stdout, no file contents, no container names. A post-mortem of <i>scheduling</i>, nothing more.</p>
+            </div>
+            <div class="card"><h3>🧭 Honest edges → roadmap</h3>
+              <p style="font-size:13.5px;">Window lives only while the daemon runs · kernel ring drops aren’t observable via aya (reported 0) · PID filter is coarse (pids aren’t stable) · <b>next:</b> block I/O event sources, cgroup scoping, sampling, persistent history, remote shipping.</p>
+            </div>
+          </div>
+          <div class="center-wrap" style="flex:none; margin-top:10px; gap:8px;">
+            <div style="font-size:20px; color:var(--muted);">The recorder is always on — <b style="color:var(--ink);">so the moment you need is never lost.</b></div>
+            <div style="font-family:var(--mono); font-size:14px; color:var(--accent);">github.com/Srujan-rai/Blackbox</div>
+            <div style="font-size:12.5px; color:var(--faint);">Rust · aya · eBPF · CO-RE · BTF — questions?</div>
+          </div>
+        </div>
+        <div class="slide-footer"><span>Blackbox · thank you</span><span>13</span></div>
+      </section>
+
+    </div>
+
+    <!-- overlay controls (presentation mode) -->
+    <div class="deckbar" id="deckbar">
+      <button class="navbtn" id="b-prev" title="Previous (←)">◀</button>
+      <span class="count" id="count">1 / 13</span>
+      <button class="navbtn" id="b-next" title="Next (→)">▶</button>
+      <span style="width:1px; height:18px; background:var(--line);"></span>
+      <button class="navbtn" id="b-grid" title="All slides (G)">▦</button>
+      <button class="navbtn" id="b-help" title="Help (?)">?</button>
+      <button class="navbtn" id="b-fs" title="Fullscreen (F)">⛶</button>
+    </div>
+  </div>
+</div>
+
+<!-- overview grid -->
+<div id="grid">
+  <div class="grid-head">
+    <h2>All slides</h2>
+    <span>click a card to jump · ⛶ to present it fullscreen</span>
+    <span class="spacer" style="flex:1;"></span>
+    <button class="btn primary" id="grid-close">✕ Close (Esc / G)</button>
+  </div>
+  <div class="grid-cards" id="grid-cards"></div>
+</div>
+
+<!-- help -->
+<div id="help">
+  <div class="help-box">
+    <h3>Presentation shortcuts</h3>
+    <div class="help-grid">
+      <div class="r"><span>Next / previous slide</span><span class="k">→ · Space · ←</span></div>
+      <div class="r"><span>First / last</span><span class="k">Home · End</span></div>
+      <div class="r"><span>All-slides overview</span><span class="k">G</span></div>
+      <div class="r"><span>Fullscreen (deck)</span><span class="k">F</span></div>
+      <div class="r"><span>Go to slide by number</span><span class="k">1…9, 0</span></div>
+      <div class="r"><span>Help / close</span><span class="k">? · Esc</span></div>
+    </div>
+    <div style="margin-top:18px; display:flex; justify-content:flex-end;">
+      <button class="btn primary" id="help-close">Got it</button>
+    </div>
+  </div>
+</div>
+
+<div id="progress"></div>
+
+<script>
+(function(){
+  "use strict";
+  var deck    = document.getElementById("deck");
+  var stage   = document.querySelector(".stage");
+  var grid    = document.getElementById("grid");
+  var help    = document.getElementById("help");
+  var deckbar = document.getElementById("deckbar");
+  var slides  = Array.prototype.slice.call(document.querySelectorAll(".slide"));
+  var N = slides.length, cur = 0, gridOpen = false, helpOpen = false, fs = false, idleTimer = null;
+
+  /* ---------- sizing: fit the 1280×720 deck into the stage ---------- */
+  function fit(){
+    var w = stage.clientWidth, h = stage.clientHeight;
+    var s = Math.min(w / 1280, h / 720);
+    document.documentElement.style.setProperty("--s", s.toFixed(5));
+  }
+  window.addEventListener("resize", fit);
+
+  /* ---------- thumbnails ---------- */
+  var cards = document.getElementById("grid-cards");
+  slides.forEach(function(s, i){
+    var clone = s.cloneNode(true);
+    clone.style.cssText = "position:absolute;inset:0;opacity:1;visibility:visible;animation:none;pointer-events:none;";
+    var wrap = document.createElement("div");
+    wrap.className = "view";
+    wrap.appendChild(clone);
+    var sub = document.createElement("div"); sub.className = "sub";
+    var t = document.createElement("span"); t.className = "t"; t.textContent = s.dataset.t || ("Slide " + (i+1));
+    var im = document.createElement("span"); im.className = "im"; im.textContent = (i+1) + " / " + N;
+    sub.appendChild(t); sub.appendChild(im);
+    var card = document.createElement("div"); card.className = "tcard";
+    var play = document.createElement("button"); play.className = "play"; play.title = "Present this slide fullscreen"; play.innerHTML = "⛶";
+    card.appendChild(wrap); card.appendChild(sub); card.appendChild(play);
+    card.addEventListener("click", function(e){ if(e.target !== play){ closeGrid(); show(i); wake(); } });
+    play.addEventListener("click", function(e){
+      e.stopPropagation(); closeGrid(); show(i); enterFs();
+    });
+    cards.appendChild(card);
+  });
+
+  /* scale each thumbnail's inner slide to its card */
+  function fitThumbs(){
+    var clones = cards.querySelectorAll(".tcard .view");
+    for (var i = 0; i < clones.length; i++){
+      var v = clones[i], r = v.getBoundingClientRect();
+      var s = Math.min(r.width / 1280, r.height / 720);
+      var inner = v.firstElementChild;
+      inner.style.transform = "translate(-50%,-50%) scale(" + s.toFixed(5) + ")";
+      inner.style.left = "50%"; inner.style.top = "50%";
+    }
+  }
+  window.addEventListener("resize", fitThumbs);
+
+  /* ---------- navigation ---------- */
+  function show(i){
+    cur = Math.max(0, Math.min(N - 1, i));
+    slides.forEach(function(s, k){ s.classList.toggle("active", k === cur); });
+    document.getElementById("count").textContent = (cur + 1) + " / " + N;
+    document.getElementById("progress").style.width = ((cur + 1) / N * 100).toFixed(1) + "%";
+    try{ history.replaceState(null, "", "#" + (cur + 1)); }catch(e){}
+    wake();
+  }
+  function next(){ show(cur + 1); }
+  function prev(){ show(cur - 1); }
+
+  /* ---------- grid / help / fullscreen ---------- */
+  function openGrid(){ closeHelp(); gridOpen = true; grid.classList.add("open"); fitThumbs(); }
+  function closeGrid(){ gridOpen = false; grid.classList.remove("open"); }
+  function toggleGrid(){ gridOpen ? closeGrid() : openGrid(); }
+  function openHelp(){ helpOpen = true; help.classList.add("open"); }
+  function closeHelp(){ helpOpen = false; help.classList.remove("open"); }
+  function toggleHelp(){ helpOpen ? closeHelp() : openHelp(); }
+
+  function enterFs(){
+    var el = document.getElementById("app");
+    if (el.requestFullscreen) el.requestFullscreen().catch(function(){});
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+  }
+  function exitFs(){
+    if (document.exitFullscreen) document.exitFullscreen();
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  }
+  function toggleFs(){ document.fullscreenElement ? exitFs() : enterFs(); }
+  document.addEventListener("fullscreenchange", function(){ fs = !!document.fullscreenElement; wake(); });
+  document.addEventListener("webkitfullscreenchange", function(){ fs = !!document.webkitFullscreenElement; wake(); });
+
+  /* ---------- auto-hiding control bar ---------- */
+  function wake(){
+    deckbar.classList.add("show");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function(){ if(!helpOpen) deckbar.classList.remove("show"); }, 3000);
+  }
+  ["mousemove","keydown","touchstart","pointerdown"].forEach(function(ev){
+    document.addEventListener(ev, function(){ if(fs || gridOpen === false) wake(); }, {passive:true});
+  });
+
+  /* ---------- keyboard ---------- */
+  function numToIdx(n){ return n === 0 ? N - 1 : (n - 1); }
+  document.addEventListener("keydown", function(e){
+    if (helpOpen && e.key !== "Escape" && e.key !== "?") { return; }
+    switch (e.key){
+      case "ArrowRight": case "PageDown": case " ": case "Enter": if(!gridOpen) next(); break;
+      case "ArrowLeft":  case "PageUp":   prev(); break;
+      case "Home": show(0); break;
+      case "End":  show(N - 1); break;
+      case "g": case "G": toggleGrid(); break;
+      case "f": case "F": if(!gridOpen) toggleFs(); break;
+      case "Escape":
+        if (helpOpen) closeHelp();
+        else if (gridOpen) closeGrid();
+        break;
+      case "?": if(!gridOpen) toggleHelp(); break;
+      default:
+        if (!gridOpen && e.key >= "1" && e.key <= "9") show(numToIdx(parseInt(e.key,10)));
+        else if (!gridOpen && e.key === "0") show(N - 1);
+    }
+  });
+
+  /* ---------- touch swipe ---------- */
+  var tx = null;
+  document.addEventListener("touchstart", function(e){ tx = e.changedTouches[0].clientX; }, {passive:true});
+  document.addEventListener("touchend", function(e){
+    if (gridOpen || tx === null) return;
+    var dx = e.changedTouches[0].clientX - tx;
+    if (Math.abs(dx) > 60) dx < 0 ? next() : prev();
+    tx = null;
+  }, {passive:true});
+
+  /* ---------- buttons ---------- */
+  document.getElementById("btn-fs").addEventListener("click", function(){ enterFs(); });
+  document.getElementById("btn-grid").addEventListener("click", openGrid);
+  document.getElementById("btn-help").addEventListener("click", openHelp);
+  document.getElementById("grid-close").addEventListener("click", closeGrid);
+  document.getElementById("help-close").addEventListener("click", closeHelp);
+  document.getElementById("b-prev").addEventListener("click", prev);
+  document.getElementById("b-next").addEventListener("click", next);
+  document.getElementById("b-grid").addEventListener("click", toggleGrid);
+  document.getElementById("b-help").addEventListener("click", toggleHelp);
+  document.getElementById("b-fs").addEventListener("click", toggleFs);
+
+  /* ---------- boot ---------- */
+  fit(); fitThumbs();
+  var start = parseInt((location.hash || "").replace("#",""), 10) || 1;
+  show(Math.max(0, Math.min(N - 1, start - 1)));
+  if (location.hash === "#g") openGrid();
+})();
+</script>
+</body>
+</html>

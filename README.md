@@ -66,6 +66,9 @@ bounded window, a handful of triggers, and two export formats.
   runs the whole flow end to end; [`scripts/bench.sh`](scripts/bench.sh) measures
   the daemon's cost on a scheduler-heavy workload (results in
   [`docs/overhead.md`](docs/overhead.md)).
+- **13-slide walkthrough** — [`docs/presentation.html`](docs/presentation.html) is
+  a self-contained, offline HTML deck: open it in a browser, press `F` to present
+  fullscreen, `G` for the all-slides grid.
 
 ## Scope
 
