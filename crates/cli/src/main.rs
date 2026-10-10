@@ -32,6 +32,8 @@ enum Cmd {
     },
     /// Show daemon status
     Status,
+    /// Stop the daemon cleanly (workers joined, socket and PID file removed)
+    Stop,
     /// Trigger a manual dump
     Dump {
         /// Output file
@@ -237,6 +239,39 @@ fn main() -> Result<()> {
         Cmd::Start { config, foreground } => start(&config, foreground)?,
         Cmd::Status => match send_request(&Request::Status)? {
             Response::Status(info) => print_status(info),
+            Response::Error(e) => anyhow::bail!(e),
+            _ => anyhow::bail!("unexpected response from daemon"),
+        },
+        Cmd::Stop => match send_request(&Request::Stop)? {
+            Response::Stop(result) => {
+                if !result.success {
+                    anyhow::bail!(result.message);
+                }
+                println!("blackboxd: {}", result.message);
+                // Give the daemon a moment to join its workers and remove the
+                // socket and PID file, so `stop` reports the finished state
+                // rather than the requested one. A socket that survives the
+                // deadline means a worker is stuck.
+                let mut gone = false;
+                for _ in 0..50 {
+                    let any = DEFAULT_SOCKET_PATHS
+                        .iter()
+                        .any(|p| UnixStream::connect(p).is_ok());
+                    if !any {
+                        gone = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if gone {
+                    println!("blackboxd stopped");
+                } else {
+                    anyhow::bail!(
+                        "blackboxd acknowledged the stop but is still listening; \
+                         check its log or send SIGTERM to its pid"
+                    );
+                }
+            }
             Response::Error(e) => anyhow::bail!(e),
             _ => anyhow::bail!("unexpected response from daemon"),
         },

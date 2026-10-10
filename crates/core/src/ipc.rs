@@ -8,12 +8,14 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     Status,
     Dump { output: Option<String> },
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Status(StatusInfo),
     Dump(DumpResult),
+    Stop(StopResult),
     Error(String),
 }
 
@@ -54,6 +56,12 @@ pub struct StatusInfo {
 pub struct DumpResult {
     pub success: bool,
     pub path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StopResult {
+    pub success: bool,
     pub message: String,
 }
 
@@ -171,6 +179,26 @@ mod tests {
             serde_json::from_str::<Response>(&text).unwrap(),
             Response::Error("boom".into())
         );
+    }
+
+    #[test]
+    fn stop_request_and_response_round_trip_through_json() {
+        let req = Request::Stop;
+        let text = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), req);
+
+        let resp = Response::Stop(StopResult {
+            success: true,
+            message: "stop requested".into(),
+        });
+        let text = serde_json::to_string(&resp).unwrap();
+        match serde_json::from_str::<Response>(&text).unwrap() {
+            Response::Stop(s) => {
+                assert!(s.success);
+                assert_eq!(s.message, "stop requested");
+            }
+            other => panic!("expected stop response, got {other:?}"),
+        }
     }
 
     #[test]

@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::Context;
 use blackbox_core::config::{Config, BPF_OBJECT_ENV};
 use blackbox_core::history::HistoryRing;
-use blackbox_core::ipc::{DumpResult, Request, Response, StatusInfo};
+use blackbox_core::ipc::{DumpResult, Request, Response, StatusInfo, StopResult};
 use blackbox_core::psi::PressureMonitor;
 use blackboxd::collect::{
     lock_runtime, request_stop, run_collector, run_triggers, stop_requested, SharedRuntime,
@@ -129,6 +129,17 @@ fn handle_client(
                     message: format!("dump failed: {err:#}"),
                 }),
             }
+        }
+        Request::Stop => {
+            // Ask every loop to wind down; serve() returns on the next loop
+            // iteration once the response below is on the wire, and main() then
+            // joins the workers and removes the socket and PID file — the same
+            // clean shutdown path a SIGTERM takes.
+            request_stop();
+            Response::Stop(StopResult {
+                success: true,
+                message: "stop requested".to_string(),
+            })
         }
     };
 

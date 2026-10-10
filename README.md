@@ -53,7 +53,7 @@ bounded window, a handful of triggers, and two export formats.
 - **Text report** — top CPU consumers, longest scheduler delays (time a
   runnable task waited for a CPU), most blocked time, optional per-CPU
   breakdown.
-- **Daemon + CLI over a Unix socket** — `start` / `status` / `dump`, with a
+- **Daemon + CLI over a Unix socket** — `start` / `status` / `dump` / `stop`, with a
   `--foreground` mode for service managers.
 - **Graceful degradation** — if the BPF program can't load (no object, no
   privileges, no BTF), the daemon keeps serving status, manual dumps and
@@ -205,6 +205,9 @@ blackbox report /tmp/incident.json
 # …or open it in Perfetto
 blackbox report /tmp/incident.json --perfetto > /tmp/incident.perfetto.json
 # then drag it onto https://ui.perfetto.dev/
+
+# Shut the daemon down cleanly (joins workers, removes socket and PID file)
+blackbox stop
 ```
 
 A real `blackbox status` from a running daemon:
@@ -269,6 +272,7 @@ measuring itself.)
 | `blackbox start [--config PATH] [--foreground]` | Start the daemon (detached by default). |
 | `blackbox status` | Show daemon health, collection state, ring-buffer counters and last trigger. |
 | `blackbox dump [-o FILE]` | Trigger a manual dump (configured directory, or `-o`). |
+| `blackbox stop` | Shut the daemon down cleanly: workers joined, socket and PID file removed. |
 | `blackbox report FILE [--perfetto] [--top N] [--per-cpu]` | Text report, or Perfetto Chrome JSON with `--perfetto`. |
 
 The CLI talks to the daemon over a Unix socket, trying
@@ -376,11 +380,11 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
   speaks line-delimited JSON over a local Unix socket, one request per
   connection.
 - **The control socket is local, not private.** The daemon creates it mode
-  `0666`, so any local user can run `blackbox status` or trigger a `dump`
-  (reading scheduler metadata of similar sensitivity to `ps` output). An
-  environment that wants the socket restricted can pre-create `/run/blackbox`
-  with a stricter mode — the daemon never tightens a directory it did not
-  create.
+  `0666`, so any local user can run `blackbox status`, trigger a `dump`
+  (reading scheduler metadata of similar sensitivity to `ps` output), or shut
+  the daemon down with `blackbox stop`. An environment that wants the socket
+  restricted can pre-create `/run/blackbox` with a stricter mode — the daemon
+  never tightens a directory it did not create.
 - **Self-describing honesty.** Dumps carry their own completeness counters, so
   a trace that lost events says so rather than looking authoritative.
 
@@ -444,7 +448,7 @@ sudo scripts/bench.sh   # baseline vs traced overhead on a switch hammer
 ```
 crates/core     blackbox-core — pure analysis: events, history, lifecycle, PSI/OOM, dumps, reports
 crates/daemon   blackboxd — BPF collector, trigger poller, IPC server
-crates/cli      blackbox — start / status / dump / report
+crates/cli      blackbox — start / status / dump / stop / report
 crates/bench    blackbox-bench — dependency-free workload for the overhead benchmark
 crates/bpf      blackbox-bpf — the tracepoint program (excluded from the workspace)
 scripts/        reproducible demo and overhead benchmark

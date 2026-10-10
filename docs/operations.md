@@ -91,8 +91,13 @@ Lifecycle events appear there as instant markers on each process's track.
 | `kernel drops` shows `0` | Expected: aya does not expose ring-buffer drop counts, so the field is always zero today. Do not read it as proof of completeness — use `events_evicted` and `window.truncated` instead. |
 | `blackbox status` says the daemon is unreachable | Check the socket path it lists; a non-root daemon falls back to `/tmp/blackboxd.sock`. A root-started daemon creates `/run/blackbox` and the socket itself with permissive modes (`0755` dir, `0666` socket, from v0.2.1) so the CLI works unprivileged; if a 0600-type `Permission denied` appears, a stale daemon from before v0.2.1 is listening — restart it. Sysadmins who pre-create `/run/blackbox` with a stricter mode control exactly who can reach the socket. |
 
+| `blackbox stop` says the daemon is still listening | A worker is stuck joining; the daemon's own deadline is the poll timeout. Check `/var/log/blackbox/blackboxd.log`, then signal the pid from the PID file (`sudo kill $(cat /run/blackbox/blackboxd.pid)`). |
+| `blackbox stop` fails because the daemon is unreachable | The daemon is already down (confirmed by `blackbox status`), or only reachable on a socket path this CLI cannot see. It is not running — no cleanup is needed. |
+
 ## Shutdown
 
-`SIGINT`/`SIGTERM` stop both worker threads within a few hundred milliseconds
-and remove the socket and PID file. The systemd unit uses `Restart=on-failure`,
+`blackbox stop` asks the daemon over the control socket to wind down; the daemon
+flips the same stop flag a `SIGINT`/`SIGTERM` does, so the three shutdown paths
+converge: both worker threads stop within a few hundred milliseconds and the
+socket and PID file are removed. The systemd unit uses `Restart=on-failure`,
 so a clean stop stays stopped.
