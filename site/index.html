@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blackbox — the eBPF scheduler post-mortem recorder</title>
+<meta name="description" content="Blackbox records every context switch on a Linux machine with eBPF and dumps a self-describing trace the moment PSI pressure or an OOM kill says a stall happened — so the next time the machine hangs, you can see exactly what it was doing.">
+<style>
+  :root {
+    --ink: #000;
+    --paper: #fff;
+    --gray-900: #111;
+    --gray-700: #444;
+    --gray-500: #777;
+    --gray-300: #c9c9c9;
+    --gray-100: #eee;
+    --gray-50: #f6f6f6;
+    --rule: 1px solid var(--ink);
+    --hair: 1px solid var(--gray-300);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--ink); }
+  img, svg { display: block; max-width: 100%; height: auto; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- masthead ---------- */
+  header {
+    position: sticky; top: 0; z-index: 20;
+    background: var(--paper);
+    border-bottom: var(--rule);
+  }
+  .mast {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; height: 60px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-weight: 800; font-size: 18px; letter-spacing: -0.01em; text-decoration: none;
+  }
+  .brand .mark {
+    width: 22px; height: 22px; background: var(--ink);
+    border-radius: 3px; position: relative;
+  }
+  .brand .mark::after {
+    content: ""; position: absolute; inset: 5px;
+    background: var(--paper); border-radius: 2px;
+  }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav a {
+    text-decoration: none; font-size: 14px; font-weight: 600;
+    padding: 6px 12px; border-radius: 999px; color: var(--gray-700);
+  }
+  nav a:hover { background: var(--ink); color: var(--paper); }
+  .tagline {
+    margin: 0; font-size: 13px; color: var(--gray-500);
+    letter-spacing: 0.04em; text-transform: uppercase;
+    border: var(--hair); border-radius: 999px; padding: 4px 12px;
+  }
+
+  /* ---------- hero ---------- */
+  .hero { border-bottom: var(--rule); background:
+    repeating-linear-gradient(0deg, transparent 0 47px, var(--gray-100) 47px 48px); }
+  .hero .wrap { padding: 96px 24px 72px; }
+  .hero p.kicker {
+    font: 700 12px/1 var(--mono); letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--gray-700); margin: 0 0 20px;
+  }
+  h1 {
+    font-size: clamp(40px, 7vw, 76px);
+    line-height: 1.02; letter-spacing: -0.03em; margin: 0 0 24px; font-weight: 850;
+  }
+  h1 .block { display: block; }
+  h1 .muted { color: var(--gray-500); }
+  .lede {
+    font-size: clamp(18px, 2.2vw, 22px); line-height: 1.5; max-width: 46rem;
+    color: var(--gray-900); margin: 0 0 36px;
+  }
+  .lede code { background: var(--gray-100); padding: 2px 7px; border-radius: 6px; font-size: 0.9em; }
+  .cta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  .btn {
+    display: inline-block; padding: 14px 26px; font-weight: 700; font-size: 16px;
+    text-decoration: none; border: 2px solid var(--ink); border-radius: 8px;
+    transition: transform .06s ease;
+  }
+  .btn.primary { background: var(--ink); color: var(--paper); }
+  .btn.ghost { color: var(--ink); }
+  .btn:hover { transform: translateY(-2px); }
+  .chips { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 40px; font: 600 12px/1 var(--mono); }
+  .chip { border: var(--hair); border-radius: 999px; padding: 8px 14px; color: var(--gray-700); background: var(--paper); }
+
+  /* ---------- section scaffolding ---------- */
+  section { border-bottom: var(--rule); }
+  .sec-head { display: flex; align-items: baseline; gap: 18px; padding: 64px 0 8px; }
+  .sec-no {
+    font: 700 14px/1 var(--mono); color: var(--paper); background: var(--ink);
+    border-radius: 6px; padding: 6px 10px; letter-spacing: 0.05em;
+  }
+  h2 { font-size: clamp(26px, 3.6vw, 38px); letter-spacing: -0.02em; margin: 0; font-weight: 800; }
+  .sec-body { padding: 28px 0 64px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px 40px; }
+  @media (max-width: 860px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+  p.lede2 { max-width: 48rem; }
+
+  h3 { font-size: 19px; margin: 28px 0 10px; font-weight: 750; }
+
+  /* ---------- figure framing ---------- */
+  figure { margin: 0; }
+  figcaption {
+    font: 500 13px/1.5 var(--mono); color: var(--gray-500); margin-top: 12px;
+  }
+  .panel {
+    border: var(--rule); border-radius: 10px; padding: 22px; background: var(--paper);
+  }
+  .panel.gray { background: var(--gray-50); }
+
+  /* ---------- feature cards ---------- */
+  .card { border-top: var(--rule); padding: 18px 2px 8px; }
+  .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0; font-size: 15px; color: var(--gray-700); }
+  .card .num { font: 700 13px/1 var(--mono); color: var(--gray-500); }
+
+  /* ---------- code ---------- */
+  pre {
+    background: var(--ink); color: var(--paper); padding: 22px 24px; border-radius: 10px;
+    overflow-x: auto; font: 400 13.5px/1.7 var(--mono); margin: 0;
+  }
+  pre .c { color: #9aa; }
+  pre .k { color: #fff; font-weight: 600; }
+  .prompt { color: #9aa; }
+  .codeblock { position: relative; }
+  .codeblock .cap {
+    font: 700 11px/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase;
+    display: block; margin-bottom: 8px; color: var(--gray-500);
+  }
+
+  table { border-collapse: collapse; width: 100%; font-size: 15px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: var(--hair); }
+  th { font: 700 12px/1.4 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--gray-700); }
+  td code { background: var(--gray-100); padding: 1px 6px; border-radius: 5px; font-size: 0.88em; }
+  .lead { font-weight: 700; }
+
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; }
+  ol.steps li { counter-increment: s; display: flex; gap: 18px; padding: 16px 0; border-top: var(--hair); }
+  ol.steps li::before {
+    content: counter(s, decimal-leading-zero);
+    font: 700 15px/1 var(--mono); color: var(--paper); background: var(--ink);
+    border-radius: 6px; padding: 8px 10px; height: fit-content;
+  }
+  ol.steps strong { display: block; }
+  ol.steps span.d { color: var(--gray-700); }
+
+  .note {
+    border-left: 4px solid var(--ink); background: var(--gray-50);
+    padding: 14px 18px; margin: 18px 0; font-size: 15px; border-radius: 0 8px 8px 0;
+  }
+  .note b { display: block; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 4px; }
+
+  .footer { padding: 48px 0 64px; background:
+    repeating-linear-gradient(0deg, transparent 0 47px, var(--gray-100) 47px 48px); }
+  .footer-in { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; align-items: center; }
+  .footer a { font-weight: 600; text-decoration: none; border-bottom: 2px solid var(--ink); }
+
+  .mono { font-family: var(--mono); }
+  @media print { header { position: static } .cta, nav { display: none } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap mast">
+    <a class="brand" href="#top"><span class="mark"></span>blackbox</a>
+    <nav>
+      <a href="#problem">Problem</a>
+      <a href="#what">What it records</a>
+      <a href="#how">How it works</a>
+      <a href="#workflow">Install</a>
+      <a href="#cost">Cost</a>
+      <a href="#limits">Limits</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ============================ HERO ============================ -->
+<div class="hero">
+  <div class="wrap">
+    <p class="kicker">eBPF · Rust · aya · Linux ≥ 5.15 (CO-RE/BTF)</p>
+    <h1>
+      <span class="block">The machine stalled.</span>
+      <span class="block muted">Blackbox watched it happen.</span>
+    </h1>
+    <p class="lede">
+      Blackbox records every context switch on a Linux host with <code>eBPF</code>,
+      keeps a bounded history in memory, and the moment <code>PSI</code> pressure or an
+      <code>OOM kill</code> says a stall happened, it writes a self-describing trace of the
+      last seconds — who was running, who was waiting, in what order.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#workflow">Get started</a>
+      <a class="btn ghost" href="https://github.com/Srujan-rai/Blackbox" rel="noopener">GitHub ↗</a>
+    </div>
+    <div class="chips">
+      <span class="chip">CO-RE · no kernel recompiles</span>
+      <span class="chip">~55 MB to trace the whole machine</span>
+      <span class="chip">schema-versioned, honest dumps</span>
+      <span class="chip">MIT</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ PROBLEM ============================ -->
+<section id="problem">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">01</span>
+      <h2>The post-mortem problem</h2>
+    </div>
+    <div class="sec-body grid2">
+      <div>
+        <p class="lede2">
+          A server degrades, deadlocks or gets OOM-killed in the middle of the night.
+          By the time you look: <b>the evidence is gone</b>. `dmesg` gives you one
+          kernel line, `journalctl` gives you logs written <i>after</i> the stall, and the
+          processes responsible are already dead or restarted.
+        </p>
+        <p>
+          The one record that survives a stall is the <b>scheduler's</b> — the kernel's
+          per-CPU run queues keep a perfect memory of the last seconds of execution.
+          Blackbox reads that memory continuously, so when the stall ends (or a systemd-shot
+          waits) the trace is already on disk.
+        </p>
+        <div class="note">
+          <b>Why the scheduler?</b>
+          A hung machine is almost always a <i>scheduling</i> story: which task held the
+          lock, which task starved, which task got OOM-killed. Context switches are the
+          chapter headings of that story.
+        </div>
+      </div>
+      <figure>
+        <svg viewBox="0 0 520 320" role="img" aria-label="Incident timeline: system under pressure, OOM kill, trace captured">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#000"/>
+            </marker>
+          </defs>
+          <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#444">
+            <line x1="20" y1="250" x2="500" y2="250" stroke="#000" stroke-width="1.5" marker-end="url(#arr)"/>
+            <text x="12" y="254" text-anchor="end">t</text>
+            <!-- pressure ramp -->
+            <polyline points="20,240 90,238 150,220 210,196 260,168 300,140" fill="none" stroke="#000" stroke-width="2"/>
+            <text x="120" y="212">pressure climbs</text>
+            <!-- threshold -->
+            <line x1="20" y1="150" x2="300" y2="150" stroke="#000" stroke-dasharray="4 4"/>
+            <text x="20" y="142">trigger threshold (80%)</text>
+            <!-- stall -->
+            <rect x="300" y="60" width="90" height="150" fill="none" stroke="#000" stroke-width="2"/>
+            <text x="345" y="52" text-anchor="middle" font-weight="700">STALL</text>
+            <text x="345" y="230" text-anchor="middle"><tspan x="345" dy="0">deadlock · iowait ·</tspan><tspan x="345" dy="14">OOM victim</tspan></text>
+            <!-- oom kill event -->
+            <line x1="390" y1="40" x2="390" y2="205" stroke="#000" stroke-width="2" marker-start="url(#arr)"/>
+            <circle cx="390" cy="205" r="4" fill="#000"/>
+            <text x="392" y="175">oom_kill fires</text>
+            <!-- dump -->
+            <rect x="420" y="205" width="70" height="28" fill="#000"/>
+            <text x="455" y="224" text-anchor="middle" fill="#fff" font-weight="700">dump</text>
+            <text x="455" y="245" text-anchor="middle">written</text>
+            <!-- trace window -->
+            <rect x="140" y="258" width="210" height="30" fill="#fff" stroke="#000"/>
+            <text x="245" y="278" text-anchor="middle">recording window (in memory)</text>
+            <text x="245" y="300" text-anchor="middle" fill="#444">survives the stall → on disk</text>
+          </g>
+        </svg>
+        <figcaption>01 — Pressure crosses the threshold, the stall happens, the trace preserves the window around it.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ WHAT ============================ -->
+<section id="what">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">02</span>
+      <h2>What it records</h2>
+    </div>
+    <div class="sec-body">
+      <div class="grid3">
+        <div class="card"><span class="num">S1</span><h3>sched_switch</h3>
+          <p>Every context switch, machine-wide: timestamp, previous task state, prev/next pid and comm, CPU id. One 64-byte record per switch, drained continuously from an 8 MiB kernel ring buffer.</p></div>
+        <div class="card"><span class="num">S2</span><h3>Lifecycle</h3>
+          <p>Process forks, execs and exits (via tracepoints), on a second 512 KiB ring buffer. A dump tells you which <em>binary path</em> appeared just before the stall.</p></div>
+        <div class="card"><span class="num">S3</span><h3>Triggers</h3>
+          <p>PSI pressure on CPU / memory / I/O with hysteresis, plus the kernel's <code>oom_kill</code> counter in <code>/proc/vmstat</code>. Any trigger fires an automatic dump.</p></div>
+      </div>
+
+      <figure>
+        <svg viewBox="0 0 840 300" role="img" aria-label="64-byte sched_switch record layout with byte offsets">
+          <g font-family="ui-monospace,Menlo,Consolas,monospace">
+            <text x="0" y="24" font-size="13" font-weight="700">sched_switch record — 64 bytes, fixed layout</text>
+            <g>
+              <rect x="0"   y="50" width="104" height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
+              <rect x="104" y="50" width="104" height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
+              <rect x="208" y="50" width="52"  height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
+              <rect x="260" y="50" width="52"  height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
+              <rect x="312" y="50" width="52"  height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
+              <rect x="364" y="50" width="208" height="56" fill="#eee" stroke="#000" stroke-width="1.5"/>
+              <rect x="572" y="50" width="208" height="56" fill="#eee" stroke="#000" stroke-width="1.5"/>
+            </g>
+            <g font-size="11" fill="#111" text-anchor="middle">
+              <text x="52"  y="78">ts_ns u64</text>
+              <text x="156" y="78">prev_state i64</text>
+              <text x="234" y="78">prev_pid</text>
+              <text x="286" y="78">next_pid</text>
+              <text x="338" y="78">cpu</text>
+              <text x="468" y="78">prev_comm [16]</text>
+              <text x="676" y="78">next_comm [16]</text>
+            </g>
+            <g font-size="9" fill="#777" text-anchor="middle">
+              <text x="52"  y="132">@0</text>
+              <text x="156" y="132">@8</text>
+              <text x="234" y="132">@16</text>
+              <text x="286" y="132">@20</text>
+              <text x="338" y="132">@24</text>
+              <text x="468" y="132">@28</text>
+              <text x="676" y="132">@44</text>
+              <text x="780" y="132">64 B total</text>
+            </g>
+          </g>
+        </svg>
+        <figcaption>02 — Every record is 64 bytes: no varint, no parse ambiguity, a compatibility <code>assert!</code> keeps the wire struct and userspace decode byte-identical.</figcaption>
+      </figure>
+
+      <div class="grid2" style="margin-top:48px">
+        <div>
+          <h3>PSI hysteresis — no dump storms</h3>
+          <figure>
+            <svg viewBox="0 0 520 240" role="img" aria-label="PSI pressure hysteresis: N consecutive samples above threshold before firing, re-arm below threshold">
+              <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#444">
+                <line x1="30" y1="200" x2="500" y2="200" stroke="#000" stroke-width="1.5" marker-end="url(#arr)"/>
+                <polyline points="30,190 70,185 110,150 150,120 185,102 215,96 240,94 260,160 290,170 320,168 350,185 380,188 410,190 440,190 470,191" fill="none" stroke="#000" stroke-width="2"/>
+                <line x1="30" y1="120" x2="500" y2="120" stroke="#000" stroke-dasharray="4 4"/>
+                <text x="30" y="112">threshold</text>
+                <rect x="150" y="70" width="90" height="120" fill="none" stroke="#000" stroke-dasharray="3 3"/>
+                <text x="195" y="62" text-anchor="middle" font-weight="700">4 consecutive → fire</text>
+                <circle cx="240" cy="94" r="4" fill="#000"/>
+                <text x="248" y="90">dump</text>
+                <text x="30" y="222">crossing alone never fires; only sustained pressure does</text>
+              </g>
+            </svg>
+            <figcaption>03 — Hysteresis: N consecutive samples over threshold before firing; re-arms only below threshold.</figcaption>
+          </figure>
+        </div>
+        <div>
+          <h3>Fires for a reason, and says why</h3>
+          <p>Every dump records <b>what triggered it</b> (manual, one of three PSI resources, or the OOM counter) and the resource's pressure readings at that moment. Reports group events into per-CPU timelines by process, so the “who was running when it went sideways” answer is the first thing you see.</p>
+          <div class="note">
+            <b>OOM is a discrete event</b>
+            Unlike PSI's levels, any advance of the kernel's <code>oom_kill</code> counter
+            in <code>/proc/vmstat</code> fires a dump — the victim's last switches are
+            exactly the evidence a later coredump loses.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ HOW ============================ -->
+<section id="how">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">03</span>
+      <h2>How it works</h2>
+    </div>
+    <div class="sec-body">
+      <figure>
+        <svg viewBox="0 0 860 420" role="img" aria-label="Architecture: kernel tracepoints feed ring buffers which the daemon drains into a bounded history; PSI and OOM triggers fire dumps to disk">
+          <defs>
+            <marker id="arr2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#000"/>
+            </marker>
+          </defs>
+          <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="12" fill="#111">
+            <!-- kernel box -->
+            <rect x="20" y="40" width="250" height="180" fill="#fff" stroke="#000" stroke-width="2"/>
+            <text x="36" y="64" font-weight="700">kernel</text>
+            <rect x="40" y="80" width="210" height="34" fill="#eee" stroke="#000"/>
+            <text x="145" y="101" text-anchor="middle">sched_switch tracepoint</text>
+            <rect x="40" y="124" width="210" height="34" fill="#eee" stroke="#000"/>
+            <text x="145" y="145" text-anchor="middle">fork / exec / exit tracepoints</text>
+            <text x="40" y="196" font-size="11" fill="#444">eBPF program: 64-byte records</text>
+            <text x="40" y="212" font-size="11" fill="#444">pid filter decided in-kernel</text>
+            <!-- ring buffers -->
+            <rect x="360" y="60" width="150" height="46" fill="#fff" stroke="#000"/>
+            <text x="435" y="79" text-anchor="middle" font-weight="700">EVENTS ring</text>
+            <text x="435" y="96" text-anchor="middle" font-size="10" fill="#444">8 MiB · kernel side</text>
+            <rect x="360" y="130" width="150" height="46" fill="#fff" stroke="#000"/>
+            <text x="435" y="149" text-anchor="middle" font-weight="700">LIFECYCLE ring</text>
+            <text x="435" y="166" text-anchor="middle" font-size="10" fill="#444">512 KiB · kernel side</text>
+            <line x1="230" y1="97" x2="360" y2="83" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
+            <line x1="250" y1="141" x2="360" y2="153" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
+            <!-- daemon box -->
+            <rect x="560" y="30" width="280" height="230" fill="#fff" stroke="#000" stroke-width="2"/>
+            <text x="576" y="54" font-weight="700">blackboxd (userspace)</text>
+            <rect x="578" y="70" width="244" height="34" fill="#eee" stroke="#000"/>
+            <text x="700" y="91" text-anchor="middle">ring drain · poll(2)</text>
+            <rect x="578" y="114" width="244" height="46" fill="#eee" stroke="#000"/>
+            <text x="700" y="135" text-anchor="middle">bounded history window</text>
+            <text x="700" y="152" text-anchor="middle" font-size="10" fill="#444">250k events / 30 s · count+time caps</text>
+            <rect x="578" y="172" width="244" height="34" fill="#eee" stroke="#000"/>
+            <text x="700" y="193" text-anchor="middle">PSI + OOM trigger poller</text>
+            <text x="578" y="238" font-size="11" fill="#444">status / dump / stop over a Unix socket (SO_PEERCRED-gated from v0.2.3)</text>
+            <line x1="510" y1="83" x2="578" y2="87" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
+            <line x1="510" y1="153" x2="578" y2="137" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
+            <line x1="700" y1="206" x2="700" y2="360" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
+            <!-- dump on trigger -->
+            <rect x="560" y="336" width="280" height="46" fill="#000"/>
+            <text x="700" y="363" text-anchor="middle" fill="#fff" font-weight="700">dump.json → disk (keep-last N)</text>
+            <line x1="360" y1="300" x2="560" y2="355" stroke="#000" stroke-width="1" stroke-dasharray="4 4"/>
+            <text x="360" y="295" font-size="11" fill="#444">trigger fires</text>
+            <!-- report -->
+            <rect x="20" y="336" width="250" height="46" fill="#fff" stroke="#000"/>
+            <text x="145" y="363" text-anchor="middle">blackbox report · Perfetto export</text>
+            <line x1="560" y1="359" x2="272" y2="359" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
+          </g>
+        </svg>
+        <figcaption>04 — The kernel does the recording; the daemon does bounded retention; the trigger is automatic; nothing needs a recompile or a custom kernel.</figcaption>
+      </figure>
+
+      <div class="grid3" style="margin-top:44px">
+        <div class="card"><span class="num">D1</span><h3>Self-describing dumps</h3>
+          <p>JSON with a schema version, its own completeness counters (<code>events_evicted</code>, <code>window.truncated</code>) and the trigger context. A trace with holes says so instead of looking authoritative.</p></div>
+        <div class="card"><span class="num">D2</span><h3>Two outputs</h3>
+          <p><code>blackbox report</code> prints a text timeline; <code>--perfetto</code> emits Chrome JSON you can drag onto <code>ui.perfetto.dev</code> for zooming/panning.</p></div>
+        <div class="card"><span class="num">D3</span><h3>Clean life</h3>
+          <p><code>start</code> · <code>status</code> · <code>dump</code> · <code>stop</code> over one control socket. systemd unit included, with <code>Restart=on-failure</code> and a sandbox.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ WORKFLOW ============================ -->
+<section id="workflow">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">04</span>
+      <h2>Install & workflow</h2>
+    </div>
+    <div class="sec-body grid2">
+      <div>
+        <ol class="steps">
+          <li><div><strong>Install</strong><span class="d">Download the release tarball for your kernel (CO-RE means one object works across kernels with BTF).</span></div></li>
+          <li><div><strong>Start it</strong><span class="d"><code class="mono">sudo blackbox start</code> attaches the tracepoints and starts collecting.</span></div></li>
+          <li><div><strong>Forget it</strong><span class="d">PSI pressure and OOM kills trigger dumps automatically into the dump directory.</span></div></li>
+          <li><div><strong>Later</strong><span class="d"><code class="mono">blackbox report dump.json</code> — or paste the Perfetto export into ui.perfetto.dev and zoom into the stall.</span></div></li>
+          <li><div><strong>Stop</strong><span class="d"><code class="mono">blackbox stop</code> shuts it down cleanly (joined workers, socket removed).</span></div></li>
+        </ol>
+      </div>
+      <div>
+        <div class="codeblock">
+          <span class="cap">$ quick start</span>
+          <pre><span class="c"># i386/x86_64 release tarball; one portable CO-RE object</span>
+<span class="prompt">$</span> tar -xzf blackbox-v0.2.3-x86_64*.tar.gz
+<span class="prompt">$</span> cd blackbox-v0.2.3-*
+<span class="prompt">$</span> sudo install -m755 blackbox blackboxd /usr/local/bin/
+<span class="prompt">$</span> sudo install -d /usr/local/lib/blackbox /etc/blackbox
+<span class="prompt">$</span> sudo install -m644 blackbox-bpf.o /usr/local/lib/blackbox/
+<span class="prompt">$</span> sudo install -m644 examples/config.toml /etc/blackbox/config.toml
+<span class="prompt">$</span> sudo blackbox start
+blackboxd started (pid 190312), listening on /run/blackbox/blackboxd.sock
+
+<span class="prompt">$</span> blackbox status
+bpf collection    attached
+  scope           machine-wide (no pid filter)
+
+<span class="prompt">$</span> blackbox dump -o /tmp/out.json
+dump written to /tmp/out.json
+
+<span class="prompt">$</span> blackbox report /tmp/out.json
+<span class="prompt">$</span> blackbox report /tmp/out.json --perfetto &gt; out.pftrace
+<span class="prompt">$</span> blackbox stop                 <span class="c"># clean shutdown</span>
+blackboxd: stop requested
+blackboxd stopped</pre>
+        </div>
+        <div class="note" style="margin-top:20px">
+          <b>Requirements</b>
+          Linux ≥ 5.15 with BTF exposed, and root (or <code>CAP_BPF</code>+<code>CAP_PERFMON</code>)
+          for the one privileged act — attaching. Everything after that runs unprivileged.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ COST ============================ -->
+<section id="cost">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">05</span>
+      <h2>Cost: memory & CPU, honestly</h2>
+    </div>
+    <div class="sec-body grid2">
+      <div>
+        <h3>Memory — measured</h3>
+        <table>
+          <tr><th>Mode</th><th>RSS (measured)</th><th>Where</th></tr>
+          <tr><td class="lead">Development / no BPF</td><td>~3.3 MB</td><td>userspace</td></tr>
+          <tr><td class="lead">Collection attached</td><td>~55 MB</td><td>userspace</td></tr>
+          <tr><td class="lead">EVENTS ring</td><td>8 MiB</td><td>kernel</td></tr>
+          <tr><td class="lead">LIFECYCLE ring</td><td>512 KiB</td><td>kernel</td></tr>
+        </table>
+        <p style="font-size:15px;color:var(--gray-700)">
+          The history window starts at 512 KB (8192 slots) and grows <em>lazily</em> to at most
+          <code>max_events × 64 B</code> — up to 16 MB at the 250k default. Flat whether
+          idle or at a full window.
+        </p>
+        <div class="note">
+          <b>Window math</b>
+          The window is <code>min(max_events / ingest-rate, max_seconds)</code>.
+          At 500k switches/s the 250k cap holds only ~0.5 s — <em>exactly when you need the
+          trace most</em>. Raise <code>max_events</code>, or scope with
+          <code>filter_pids</code> to cut ingest.
+        </div>
+      </div>
+      <div>
+        <h3>CPU — measured, worst case</h3>
+        <figure>
+          <svg viewBox="0 0 520 260" role="img" aria-label="Overhead bars: machine-wide ~0.6 core and 26-63% slowdown on a switch-heavy microbenchmark; with the PID filter 1.5-4.7%">
+            <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#111">
+              <text x="0" y="20" font-weight="700">switch-heavy workload, worst-case microbenchmark</text>
+              <text x="0" y="52">machine-wide</text>
+              <rect x="160" y="40" width="250" height="22" fill="#000"/>
+              <text x="418" y="56">+26 – 63%</text>
+              <text x="0" y="92">pid-filtered</text>
+              <rect x="160" y="80" width="52" height="22" fill="#fff" stroke="#000" stroke-width="2"/>
+              <text x="220" y="96">+1.5 – 4.7%</text>
+              <text x="0" y="132" font-size="10" fill="#444">daemon CPU itself: &lt;0.6 of a core busy; ~0.15% idle</text>
+              <line x1="160" y1="150" x2="160" y2="235" stroke="#000"/>
+              <text x="160" y="250" text-anchor="middle">0</text>
+              <text x="410" y="250" text-anchor="middle">65%</text>
+            </g>
+          </svg>
+          <figcaption>05 — The tracepoint cost is real on switch-heavy hosts. The PID filter removes ingest (the bulk of it). This is why the default stance is honest: machine-wide is “dev box”, filtered is “production”.</figcaption>
+        </figure>
+        <p style="font-size:15px;color:var(--gray-700)">
+          The numbers above are from the project's own benchmark on a noisy laptop
+          (i5-1135G7, kernel 6.8). A tracepoint still fires on every switch even when the
+          filter drops the record — the hook cost is the floor.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ HOW IT HELPS ============================ -->
+<section id="helps">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">06</span>
+      <h2>What you actually get from a trace</h2>
+    </div>
+    <div class="sec-body">
+      <div class="grid3">
+        <div class="card"><span class="num">U1</span><h3>Who held the CPU</h3>
+          <p>Per-CPU, per-process timelines of runnable vs. blocked states — spot the task hogging a core while others starve, or the epoll loop spinning.</p></div>
+        <div class="card"><span class="num">U2</span><h3>Who was waiting</h3>
+          <p><code>prev_state</code> tells you each switch's reason: uninterruptible sleep under memory pressure, runnable but not picked. The pattern of starvation is the diagnosis.</p></div>
+        <div class="card"><span class="num">U3</span><h3>What died right before</h3>
+          <p>OOM-triggered dumps pin the victim's pid and comm, plus which children were forked/exec’d in the window — the blast radius in one view.</p></div>
+      </div>
+      <figure style="margin-top:40px">
+        <svg viewBox="0 0 860 260" role="img" aria-label="Scheduling gantt: three processes across two CPUs during the stall, showing a waiter blocked at the stall point">
+          <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#111">
+            <text x="0" y="18" font-weight="700">the dump's core view — per-CPU runnable/blocked by process</text>
+            <text x="0" y="52" fill="#444">cpu0</text>
+            <rect x="60" y="40" width="300" height="26" fill="#eee" stroke="#000"/>
+            <rect x="60" y="40" width="60" height="26" fill="#fff" stroke="#000"/>
+            <text x="90" y="57" text-anchor="middle">db</text>
+            <rect x="120" y="40" width="140" height="26" fill="#fff" stroke="#000"/>
+            <text x="190" y="57" text-anchor="middle">api</text>
+            <rect x="260" y="40" width="40" height="26" fill="#fff" stroke="#000"/>
+            <text x="280" y="57" text-anchor="middle">api</text>
+            <rect x="300" y="40" width="150" height="26" fill="#000"/>
+            <text x="375" y="57" text-anchor="middle" fill="#fff">api spins · 100% cpu0</text>
+            <text x="0" y="92" fill="#444">cpu1</text>
+            <rect x="60" y="80" width="120" height="26" fill="#eee" stroke="#000"/>
+            <rect x="60" y="80" width="60" height="26" fill="#fff" stroke="#000"/>
+            <text x="90" y="97" text-anchor="middle">worker</text>
+            <rect x="120" y="80" width="330" height="26" fill="#fff" stroke="#000" stroke-dasharray="5 4"/>
+            <text x="285" y="97" text-anchor="middle">worker · RUNNABLE but never scheduled (starvation)</text>
+            <text x="0" y="130" fill="#444">both</text>
+            <rect x="60" y="118" width="470" height="24" fill="#eee" stroke="#000"/>
+            <text x="295" y="134" text-anchor="middle">stall boundary — oom_kill at the right edge</text>
+            <g font-size="10" fill="#777">
+              <line x1="60" y1="152" x2="530" y2="152" stroke="#000"/>
+              <text x="60" y="168">t-2s</text>
+              <text x="500" y="168" text-anchor="end">t0 · stall</text>
+            </g>
+          </g>
+        </svg>
+        <figcaption>06 — What a stall reads like: cpu0 fully owned by one spinning task, the worker starved on cpu1, the OOM counter at the edge.</figcaption>
+      </figure>
+
+      <div class="grid2" style="margin-top:44px">
+        <div class="panel gray">
+          <h3>Good for ·</h3>
+          <ul>
+            <li>Nightly-load failures with no obvious log cause</li>
+            <li>“It hangs for 30 s then recovers” — the window shows the interlock</li>
+            <li>CI boxes under memory pressure obvious in <code>oom_kill</code></li>
+            <li>Teaching: a live machine's scheduler as a visible, explainable trace</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h3>Not (yet) for ·</h3>
+          <ul>
+            <li>Continuous profiling — it's a recorder, not a flamegraph tool</li>
+            <li>Multi-minute post-mortems without raising <code>max_events</code></li>
+            <li>I/O root-causing — no block-layer sources yet (roadmap)</li>
+            <li>History across daemon restarts (in-memory window only)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ SECURITY ============================ -->
+<section id="security">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">07</span>
+      <h2>Security stance</h2>
+    </div>
+    <div class="sec-body grid3">
+      <div class="card"><span class="num">P1</span><h3>Least privilege</h3>
+        <p>Attaching BPF is the only privileged act. PSI reads, dumps, reports run with no capabilities. The CO-RE object never needs a kernel recompile.</p></div>
+      <div class="card"><span class="num">P2</span><h3>Privacy by design</h3>
+        <p>Only scheduler metadata: comm (15 chars), pids, state, timestamps, cpu. No argv, no environment, no memory contents. An exec path up to 15 chars.</p></div>
+      <div class="card"><span class="num">P3</span><h3>No network, gated socket</h3>
+        <p>A local Unix socket only. Status is open to local users; <code>dump</code>/<code>stop</code> require the daemon owner or root via <code>SO_PEERCRED</code> (v0.2.3+), with <code>[ipc].restrict_mutations</code> to relax on single-user boxes.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ LIMITS ============================ -->
+<section id="limits">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-no">08</span>
+      <h2>Honest limits</h2>
+    </div>
+    <div class="sec-body">
+      <table>
+        <tr><th>Limit</th><th>What it means</th><th>Mitigation</th></tr>
+        <tr><td class="lead">Machine-wide overhead</td><td>Tracepoint fires on every switch; ~0.6 core + 26–63% worst case on switch-heavy load</td><td><code>filter_pids</code> → +1.5–4.7%; scope to the box that matters</td></tr>
+        <tr><td class="lead">Bounded window</td><td>250k events / 30 s default; short at 500k switches/s</td><td>Raise <code>max_events</code>, PID-filter ingest</td></tr>
+        <tr><td class="lead">History in RAM only</td><td>Daemon restart loses the window — and the crash you care about may kill the daemon</td><td>Persistent dump is the long-term answer (roadmap)</td></tr>
+        <tr><td class="lead">I/O blind spots</td><td>Shows blocked-without-CPU, not the block reason</td><td>Block-layer sources planned</td></tr>
+        <tr><td class="lead">Young project</td><td>v0.2 · 30+ commits · single maintainer</td><td>180 tests, schema-versioned dumps, honest docs</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-in">
+    <span class="mono" style="font-size:13px;color:var(--gray-700)">blackbox — the eBPF scheduler post-mortem recorder</span>
+    <span class="mono" style="font-size:13px">
+      <a href="https://github.com/Srujan-rai/Blackbox" rel="noopener">github.com/Srujan-rai/Blackbox ↗</a>
+      &nbsp;·&nbsp; v0.2 · MIT
+    </span>
+  </div>
+</footer>
+
+</body>
+</html>

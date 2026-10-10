@@ -146,6 +146,24 @@ because a `continue` skipped its sleep — and fixing it cut daemon CPU from 1.6
 to 0.6 cores. Full method, raw numbers, caveats and the reproduction commands
 are in [`docs/overhead.md`](docs/overhead.md).
 
+### Memory & window
+
+All costs are bounded and predictable:
+
+- **Process memory (measured).** ~3.3 MB RSS in `--no-bpf` / development mode;
+  ~55 MB RSS with BPF collection attached on the reference host (kernel 6.8,
+  aya 0.14) — flat whether the history window is empty or at its 250k cap.
+- **Kernel side (fixed at compile time).** 8 MiB events ring buffer + 512 KiB
+  lifecycle ring buffer, plus a few KB of maps and the tracepoint programs.
+- **History window (userspace).** Starts at 512 KB (8192 × 64-byte slots) and
+  grows *lazily* to at most `max_events × 64 B` — up to 16 MB at the default
+  250,000 events.
+- **Window math.** The trace is `min(max_events / event-rate, max_seconds)`
+  wide. At 500k switches/s the default cap holds only ~0.5 s — precisely the
+  situation where you need the trace most. Raise `max_events` (memory follows
+  at 64 B per event), or cut ingest with `[bpf].filter_pids`; `max_seconds`
+  only widens already-quiet windows.
+
 ## Requirements
 
 - **Linux 5.15 or newer** (BPF ring buffer + BTF + PSI). CO-RE needs
