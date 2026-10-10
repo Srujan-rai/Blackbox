@@ -309,6 +309,10 @@ timestamped_names = true
 [bpf]
 # object_path = "/usr/local/lib/blackbox/blackbox-bpf.o"
 # filter_pids = [1234, 5678]   # trace only these pids (max 32); empty = all
+
+[ipc]
+# restrict_mutations = true   # (default) dump/stop need the daemon owner or root;
+#                             # status is always open. false = any local user.
 ```
 
 `consecutive` is the hysteresis: N samples over threshold before firing. After
@@ -380,11 +384,14 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
   speaks line-delimited JSON over a local Unix socket, one request per
   connection.
 - **The control socket is local, not private.** The daemon creates it mode
-  `0666`, so any local user can run `blackbox status`, trigger a `dump`
-  (reading scheduler metadata of similar sensitivity to `ps` output), or shut
-  the daemon down with `blackbox stop`. An environment that wants the socket
-  restricted can pre-create `/run/blackbox` with a stricter mode — the daemon
-  never tightens a directory it did not create.
+  `0666`, so any local user can read `blackbox status`. The mutating requests —
+  `blackbox dump` and `blackbox stop` — are gated by default (v0.2.3+) to the
+  daemon's owner and root via `SO_PEERCRED`, so an unprivileged user on a
+  shared box cannot read scheduling traces or stop collection; set
+  `[ipc].restrict_mutations = false` to widen them to every local user. An
+  environment that wants even `status` restricted can pre-create
+  `/run/blackbox` with a stricter mode — the daemon never tightens a directory
+  it did not create.
 - **Self-describing honesty.** Dumps carry their own completeness counters, so
   a trace that lost events says so rather than looking authoritative.
 

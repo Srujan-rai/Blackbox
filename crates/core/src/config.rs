@@ -36,6 +36,7 @@ pub struct Config {
     pub pressure: PressureConfig,
     pub dump: DumpConfig,
     pub bpf: BpfConfig,
+    pub ipc: IpcConfig,
 }
 
 /// Where to find the compiled BPF object (`blackbox-bpf.o`) and how to scope
@@ -61,6 +62,26 @@ pub struct BpfConfig {
 /// How many pids `[bpf].filter_pids` may list. Mirrors `FILTER_MAX` in the BPF
 /// crate (each filter slot costs one array-map entry); keep the two in sync.
 pub const MAX_FILTER_PIDS: usize = 32;
+
+/// Who may use the control socket's mutating requests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IpcConfig {
+    /// When true (the default), `dump` and `stop` are only honoured when the
+    /// caller's real uid — read via `SO_PEERCRED` — is the daemon's owner or
+    /// root. `status` stays open to every local user. Set `false` to let any
+    /// local user trigger dumps or stop the daemon (the pre-v0.2.3 behaviour,
+    /// matching the `0666` control socket).
+    pub restrict_mutations: bool,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            restrict_mutations: true,
+        }
+    }
+}
 
 impl BpfConfig {
     /// Resolve which BPF object to load.
@@ -436,6 +457,17 @@ mod tests {
     fn round_trips_through_toml() {
         let c = Config::default();
         assert_eq!(Config::from_toml(&c.to_toml()).unwrap(), c);
+    }
+
+    #[test]
+    fn ipc_section_defaults_to_restricting_mutations() {
+        // Status stays open; dump/stop are the daemon owner's or root's by
+        // default, and an operator can widen them explicitly.
+        assert!(Config::default().ipc.restrict_mutations);
+        let relaxed = Config::from_toml("[ipc]\nrestrict_mutations = false\n").unwrap();
+        assert!(!relaxed.ipc.restrict_mutations);
+        // The widened config still round-trips with all other defaults intact.
+        assert_eq!(Config::from_toml(&relaxed.to_toml()).unwrap(), relaxed);
     }
 
     #[test]

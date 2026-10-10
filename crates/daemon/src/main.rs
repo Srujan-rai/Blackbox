@@ -40,6 +40,8 @@ use clap::Parser;
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::unistd::geteuid;
 
 #[derive(Parser)]
 #[command(name = "blackboxd", version, about = "Blackbox daemon")]
@@ -68,6 +70,20 @@ const ACCEPT_POLL_MS: u16 = 250;
 /// answer in microseconds; a stalled client must not pin the IPC thread.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// May `peer_uid` run a mutating request (`dump` / `stop`)?
+///
+/// The kernel sets `SO_PEERCRED` at connect time and it cannot be spoofed
+/// across a Unix socket, so this is the caller's real identity. Root and the
+/// daemon's own owner always pass; everyone else is denied unless the operator
+/// explicitly widened the socket with `[ipc].restrict_mutations = false`.
+/// `status` is never restricted.
+fn mutations_allowed(peer_uid: Option<u32>) -> bool {
+    match peer_uid {
+        Some(uid) => uid == 0 || uid == geteuid().as_raw(),
+        None => false,
+    }
+}
+
 fn handle_client(
     stream: UnixStream,
     runtime: &SharedRuntime,
@@ -82,6 +98,18 @@ fn handle_client(
     let req: Request = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(_) => return Ok(()),
+    };
+
+    // Who is on the other end? Checked once, before the request body is even
+    // matched, so access-control decisions cannot race with the request being
+    // filled in. A peer that vanished mid-request reads as None and is denied
+    // any mutating action.
+    let peer_uid = getsockopt::<_, PeerCredentials>(&stream, PeerCredentials)
+        .map(|c| c.uid())
+        .ok();
+    let mutating_ok = {
+        let rt = lock_runtime(runtime);
+        !rt.config().ipc.restrict_mutations || mutations_allowed(peer_uid)
     };
 
     let resp = match req {
@@ -111,35 +139,53 @@ fn handle_client(
             })
         }
         Request::Dump { output } => {
-            // The whole dump (snapshot, serialise, write, retention) runs
-            // under one lock: dumps are rare, and splitting Runtime to
-            // shorten the hold would cost more correctness than it buys.
-            // Status requests queue behind it; they do not fail.
-            match lock_runtime(runtime).dump_to(output.as_deref().map(Path::new)) {
-                Ok(path) => Response::Dump(DumpResult {
-                    success: true,
-                    path: Some(path.to_string_lossy().to_string()),
-                    message: "manual dump completed".to_string(),
-                }),
-                // Report the failure over the socket: dropping the connection
-                // instead would leave the CLI staring at an EOF with no cause.
-                Err(err) => Response::Dump(DumpResult {
-                    success: false,
-                    path: None,
-                    message: format!("dump failed: {err:#}"),
-                }),
+            if !mutating_ok {
+                // Access-control response, matching the error path's style:
+                // never drop the connection for a request we can answer.
+                Response::Error(
+                    "permission denied: dumps are restricted to the daemon owner or root; \
+                     rerun with sudo, or set [ipc].restrict_mutations = false"
+                        .to_string(),
+                )
+            } else {
+                // The whole dump (snapshot, serialise, write, retention) runs
+                // under one lock: dumps are rare, and splitting Runtime to
+                // shorten the hold would cost more correctness than it buys.
+                // Status requests queue behind it; they do not fail.
+                match lock_runtime(runtime).dump_to(output.as_deref().map(Path::new)) {
+                    Ok(path) => Response::Dump(DumpResult {
+                        success: true,
+                        path: Some(path.to_string_lossy().to_string()),
+                        message: "manual dump completed".to_string(),
+                    }),
+                    // Report the failure over the socket: dropping the connection
+                    // instead would leave the CLI staring at an EOF with no cause.
+                    Err(err) => Response::Dump(DumpResult {
+                        success: false,
+                        path: None,
+                        message: format!("dump failed: {err:#}"),
+                    }),
+                }
             }
         }
         Request::Stop => {
-            // Ask every loop to wind down; serve() returns on the next loop
-            // iteration once the response below is on the wire, and main() then
-            // joins the workers and removes the socket and PID file — the same
-            // clean shutdown path a SIGTERM takes.
-            request_stop();
-            Response::Stop(StopResult {
-                success: true,
-                message: "stop requested".to_string(),
-            })
+            if !mutating_ok {
+                Response::Error(
+                    "permission denied: stop is restricted to the daemon owner or root; \
+                     rerun with sudo, or set [ipc].restrict_mutations = false"
+                        .to_string(),
+                )
+            } else {
+                // Ask every loop to wind down; serve() returns on the next loop
+                // iteration once the response below is on the wire, and main()
+                // then joins the workers and removes the socket and PID file —
+                // the same clean shutdown path a SIGTERM takes.
+                request_stop();
+                Response::Stop(StopResult {
+                    success: true,
+                    message: "stop requested".to_string(),
+                })
+            }
         }
     };
 

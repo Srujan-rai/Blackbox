@@ -46,3 +46,11 @@ timestamped_names = true
 # the filter removes the ingest/decode/history cost, which is the bulk of the
 # daemon's CPU on a busy host (see docs/overhead.md).
 # filter_pids = []
+
+[ipc]
+# Whether `blackbox dump` and `blackbox stop` require the daemon's owner or
+# root. Access is checked per request via SO_PEERCRED on the control socket
+# against the daemon's real (unspoofable) caller identity; `status` is always
+# open to every local user. Set false on a single-user box to let any local
+# user trigger dumps or stop the daemon (the pre-v0.2.3 behaviour).
+restrict_mutations = true
