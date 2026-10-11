@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blackbox — the eBPF scheduler post-mortem recorder</title>
-<meta name="description" content="Blackbox records every context switch on a Linux machine with eBPF and dumps a self-describing trace the moment PSI pressure or an OOM kill says a stall happened — so the next time the machine hangs, you can see exactly what it was doing.">
+<title>Blackbox · the eBPF scheduler post-mortem recorder</title>
+<meta name="description" content="Blackbox records every context switch on a Linux machine with eBPF and dumps a self-describing trace the moment PSI pressure or an OOM kill says a stall happened, so the next time the machine hangs, you can see exactly what it was doing.">
 <style>
   :root {
     --ink: #000;
@@ -207,7 +207,7 @@
       Blackbox records every context switch on a Linux host with <code>eBPF</code>,
       keeps a bounded history in memory, and the moment <code>PSI</code> pressure or an
       <code>OOM kill</code> says a stall happened, it writes a self-describing trace of the
-      last seconds — who was running, who was waiting, in what order.
+      last seconds: who was running, who was waiting, in what order.
     </p>
     <div class="cta">
       <a class="btn primary" href="#workflow">Get started</a>
@@ -238,7 +238,7 @@
           processes responsible are already dead or restarted.
         </p>
         <p>
-          The one record that survives a stall is the <b>scheduler's</b> — the kernel's
+          The one record that survives a stall is the <b>scheduler's</b>: the kernel's
           per-CPU run queues keep a perfect memory of the last seconds of execution.
           Blackbox reads that memory continuously, so when the stall ends (or a systemd-shot
           waits) the trace is already on disk.
@@ -284,7 +284,7 @@
             <text x="245" y="300" text-anchor="middle" fill="#444">survives the stall → on disk</text>
           </g>
         </svg>
-        <figcaption>01 — Pressure crosses the threshold, the stall happens, the trace preserves the window around it.</figcaption>
+        <figcaption>01 · Pressure crosses the threshold, the stall happens, the trace preserves the window around it.</figcaption>
       </figure>
     </div>
   </div>
@@ -310,7 +310,7 @@
       <figure>
         <svg viewBox="0 0 840 300" role="img" aria-label="64-byte sched_switch record layout with byte offsets">
           <g font-family="ui-monospace,Menlo,Consolas,monospace">
-            <text x="0" y="24" font-size="13" font-weight="700">sched_switch record — 64 bytes, fixed layout</text>
+            <text x="0" y="24" font-size="13" font-weight="700">sched_switch record · 64 bytes, fixed layout</text>
             <g>
               <rect x="0"   y="50" width="104" height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
               <rect x="104" y="50" width="104" height="56" fill="#fff" stroke="#000" stroke-width="1.5"/>
@@ -341,12 +341,12 @@
             </g>
           </g>
         </svg>
-        <figcaption>02 — Every record is 64 bytes: no varint, no parse ambiguity, a compatibility <code>assert!</code> keeps the wire struct and userspace decode byte-identical.</figcaption>
+        <figcaption>02 · Every record is 64 bytes: no varint, no parse ambiguity, a compatibility <code>assert!</code> keeps the wire struct and userspace decode byte-identical.</figcaption>
       </figure>
 
       <div class="grid2" style="margin-top:48px">
         <div>
-          <h3>PSI hysteresis — no dump storms</h3>
+          <h3>PSI hysteresis: no dump storms</h3>
           <figure>
             <svg viewBox="0 0 520 240" role="img" aria-label="PSI pressure hysteresis: N consecutive samples above threshold before firing, re-arm below threshold">
               <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#444">
@@ -361,7 +361,7 @@
                 <text x="30" y="222">crossing alone never fires; only sustained pressure does</text>
               </g>
             </svg>
-            <figcaption>03 — Hysteresis: N consecutive samples over threshold before firing; re-arms only below threshold.</figcaption>
+            <figcaption>03 · Hysteresis: N consecutive samples over threshold before firing; re-arms only below threshold.</figcaption>
           </figure>
         </div>
         <div>
@@ -370,7 +370,7 @@
           <div class="note">
             <b>OOM is a discrete event</b>
             Unlike PSI's levels, any advance of the kernel's <code>oom_kill</code> counter
-            in <code>/proc/vmstat</code> fires a dump — the victim's last switches are
+            in <code>/proc/vmstat</code> fires a dump: the victim's last switches are
             exactly the evidence a later coredump loses.
           </div>
         </div>
@@ -438,7 +438,7 @@
             <line x1="560" y1="359" x2="272" y2="359" stroke="#000" stroke-width="1.5" marker-end="url(#arr2)"/>
           </g>
         </svg>
-        <figcaption>04 — The kernel does the recording; the daemon does bounded retention; the trigger is automatic; nothing needs a recompile or a custom kernel.</figcaption>
+        <figcaption>04 · The kernel does the recording; the daemon does bounded retention; the trigger is automatic; nothing needs a recompile or a custom kernel.</figcaption>
       </figure>
 
       <div class="grid3" style="margin-top:44px">
@@ -466,7 +466,7 @@
           <li><div><strong>Install</strong><span class="d">Download the release tarball for your kernel (CO-RE means one object works across kernels with BTF).</span></div></li>
           <li><div><strong>Start it</strong><span class="d"><code class="mono">sudo blackbox start</code> attaches the tracepoints and starts collecting.</span></div></li>
           <li><div><strong>Forget it</strong><span class="d">PSI pressure and OOM kills trigger dumps automatically into the dump directory.</span></div></li>
-          <li><div><strong>Later</strong><span class="d"><code class="mono">blackbox report dump.json</code> — or paste the Perfetto export into ui.perfetto.dev and zoom into the stall.</span></div></li>
+          <li><div><strong>Later</strong><span class="d"><code class="mono">blackbox report dump.json</code>, or paste the Perfetto export into ui.perfetto.dev and zoom into the stall.</span></div></li>
           <li><div><strong>Stop</strong><span class="d"><code class="mono">blackbox stop</code> shuts it down cleanly (joined workers, socket removed).</span></div></li>
         </ol>
       </div>
@@ -499,7 +499,7 @@ blackboxd stopped</pre>
         <div class="note" style="margin-top:20px">
           <b>Requirements</b>
           Linux ≥ 5.15 with BTF exposed, and root (or <code>CAP_BPF</code>+<code>CAP_PERFMON</code>)
-          for the one privileged act — attaching. Everything after that runs unprivileged.
+          for the one privileged act: attaching. Everything after that runs unprivileged.
         </div>
       </div>
     </div>
@@ -515,7 +515,7 @@ blackboxd stopped</pre>
     </div>
     <div class="sec-body grid2">
       <div>
-        <h3>Memory — measured</h3>
+        <h3>Memory, measured</h3>
         <table>
           <tr><th>Mode</th><th>RSS (measured)</th><th>Where</th></tr>
           <tr><td class="lead">Development / no BPF</td><td>~3.3 MB</td><td>userspace</td></tr>
@@ -525,19 +525,19 @@ blackboxd stopped</pre>
         </table>
         <p style="font-size:15px;color:var(--gray-700)">
           The history window starts at 512 KB (8192 slots) and grows <em>lazily</em> to at most
-          <code>max_events × 64 B</code> — up to 16 MB at the 250k default. Flat whether
+          <code>max_events × 64 B</code> (up to 16 MB at the 250k default). Flat whether
           idle or at a full window.
         </p>
         <div class="note">
           <b>Window math</b>
           The window is <code>min(max_events / ingest-rate, max_seconds)</code>.
-          At 500k switches/s the 250k cap holds only ~0.5 s — <em>exactly when you need the
+          At 500k switches/s the 250k cap holds only ~0.5 s, <em>exactly when you need the
           trace most</em>. Raise <code>max_events</code>, or scope with
           <code>filter_pids</code> to cut ingest.
         </div>
       </div>
       <div>
-        <h3>CPU — measured, worst case</h3>
+        <h3>CPU, measured, worst case</h3>
         <figure>
           <svg viewBox="0 0 520 260" role="img" aria-label="Overhead bars: machine-wide ~0.6 core and 26-63% slowdown on a switch-heavy microbenchmark; with the PID filter 1.5-4.7%">
             <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#111">
@@ -554,12 +554,12 @@ blackboxd stopped</pre>
               <text x="410" y="250" text-anchor="middle">65%</text>
             </g>
           </svg>
-          <figcaption>05 — The tracepoint cost is real on switch-heavy hosts. The PID filter removes ingest (the bulk of it). This is why the default stance is honest: machine-wide is “dev box”, filtered is “production”.</figcaption>
+          <figcaption>05 · The tracepoint cost is real on switch-heavy hosts. The PID filter removes ingest (the bulk of it). This is why the default stance is honest: machine-wide is “dev box”, filtered is “production”.</figcaption>
         </figure>
         <p style="font-size:15px;color:var(--gray-700)">
           The numbers above are from the project's own benchmark on a noisy laptop
           (i5-1135G7, kernel 6.8). A tracepoint still fires on every switch even when the
-          filter drops the record — the hook cost is the floor.
+          filter drops the record; the hook cost is the floor.
         </p>
       </div>
     </div>
@@ -576,16 +576,16 @@ blackboxd stopped</pre>
     <div class="sec-body">
       <div class="grid3">
         <div class="card"><span class="num">U1</span><h3>Who held the CPU</h3>
-          <p>Per-CPU, per-process timelines of runnable vs. blocked states — spot the task hogging a core while others starve, or the epoll loop spinning.</p></div>
+          <p>Per-CPU, per-process timelines of runnable vs. blocked states, and you spot the task hogging a core while others starve, or the epoll loop spinning.</p></div>
         <div class="card"><span class="num">U2</span><h3>Who was waiting</h3>
           <p><code>prev_state</code> tells you each switch's reason: uninterruptible sleep under memory pressure, runnable but not picked. The pattern of starvation is the diagnosis.</p></div>
         <div class="card"><span class="num">U3</span><h3>What died right before</h3>
-          <p>OOM-triggered dumps pin the victim's pid and comm, plus which children were forked/exec’d in the window — the blast radius in one view.</p></div>
+          <p>OOM-triggered dumps pin the victim's pid and comm, plus which children were forked/exec’d in the window: the blast radius in one view.</p></div>
       </div>
       <figure style="margin-top:40px">
         <svg viewBox="0 0 860 260" role="img" aria-label="Scheduling gantt: three processes across two CPUs during the stall, showing a waiter blocked at the stall point">
           <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" fill="#111">
-            <text x="0" y="18" font-weight="700">the dump's core view — per-CPU runnable/blocked by process</text>
+            <text x="0" y="18" font-weight="700">the dump's core view: per-CPU runnable/blocked by process</text>
             <text x="0" y="52" fill="#444">cpu0</text>
             <rect x="60" y="40" width="300" height="26" fill="#eee" stroke="#000"/>
             <rect x="60" y="40" width="60" height="26" fill="#fff" stroke="#000"/>
@@ -604,7 +604,7 @@ blackboxd stopped</pre>
             <text x="285" y="97" text-anchor="middle">worker · RUNNABLE but never scheduled (starvation)</text>
             <text x="0" y="130" fill="#444">both</text>
             <rect x="60" y="118" width="470" height="24" fill="#eee" stroke="#000"/>
-            <text x="295" y="134" text-anchor="middle">stall boundary — oom_kill at the right edge</text>
+            <text x="295" y="134" text-anchor="middle">stall boundary: oom_kill at the right edge</text>
             <g font-size="10" fill="#777">
               <line x1="60" y1="152" x2="530" y2="152" stroke="#000"/>
               <text x="60" y="168">t-2s</text>
@@ -612,7 +612,7 @@ blackboxd stopped</pre>
             </g>
           </g>
         </svg>
-        <figcaption>06 — What a stall reads like: cpu0 fully owned by one spinning task, the worker starved on cpu1, the OOM counter at the edge.</figcaption>
+        <figcaption>06 · What a stall reads like: cpu0 fully owned by one spinning task, the worker starved on cpu1, the OOM counter at the edge.</figcaption>
       </figure>
 
       <div class="grid2" style="margin-top:44px">
@@ -620,7 +620,7 @@ blackboxd stopped</pre>
           <h3>Good for ·</h3>
           <ul>
             <li>Nightly-load failures with no obvious log cause</li>
-            <li>“It hangs for 30 s then recovers” — the window shows the interlock</li>
+            <li>“It hangs for 30 s then recovers”: the window shows the interlock</li>
             <li>CI boxes under memory pressure obvious in <code>oom_kill</code></li>
             <li>Teaching: a live machine's scheduler as a visible, explainable trace</li>
           </ul>
@@ -628,9 +628,9 @@ blackboxd stopped</pre>
         <div class="panel">
           <h3>Not (yet) for ·</h3>
           <ul>
-            <li>Continuous profiling — it's a recorder, not a flamegraph tool</li>
+            <li>Continuous profiling: it's a recorder, not a flamegraph tool</li>
             <li>Multi-minute post-mortems without raising <code>max_events</code></li>
-            <li>I/O root-causing — no block-layer sources yet (roadmap)</li>
+            <li>I/O root-causing: no block-layer sources yet (roadmap)</li>
             <li>History across daemon restarts (in-memory window only)</li>
           </ul>
         </div>
@@ -669,7 +669,7 @@ blackboxd stopped</pre>
         <tr><th>Limit</th><th>What it means</th><th>Mitigation</th></tr>
         <tr><td class="lead">Machine-wide overhead</td><td>Tracepoint fires on every switch; ~0.6 core + 26–63% worst case on switch-heavy load</td><td><code>filter_pids</code> → +1.5–4.7%; scope to the box that matters</td></tr>
         <tr><td class="lead">Bounded window</td><td>250k events / 30 s default; short at 500k switches/s</td><td>Raise <code>max_events</code>, PID-filter ingest</td></tr>
-        <tr><td class="lead">History in RAM only</td><td>Daemon restart loses the window — and the crash you care about may kill the daemon</td><td>Persistent dump is the long-term answer (roadmap)</td></tr>
+        <tr><td class="lead">History in RAM only</td><td>Daemon restart loses the window, and the crash you care about may kill the daemon</td><td>Persistent dump is the long-term answer (roadmap)</td></tr>
         <tr><td class="lead">I/O blind spots</td><td>Shows blocked-without-CPU, not the block reason</td><td>Block-layer sources planned</td></tr>
         <tr><td class="lead">Young project</td><td>v0.2 · 30+ commits · single maintainer</td><td>180 tests, schema-versioned dumps, honest docs</td></tr>
       </table>
@@ -681,7 +681,7 @@ blackboxd stopped</pre>
 
 <footer class="footer">
   <div class="wrap footer-in">
-    <span class="mono" style="font-size:13px;color:var(--gray-700)">blackbox — the eBPF scheduler post-mortem recorder</span>
+    <span class="mono" style="font-size:13px;color:var(--gray-700)">blackbox · the eBPF scheduler post-mortem recorder</span>
     <span class="mono" style="font-size:13px">
       <a href="https://github.com/Srujan-rai/Blackbox" rel="noopener">github.com/Srujan-rai/Blackbox ↗</a>
       &nbsp;·&nbsp; v0.2 · MIT
