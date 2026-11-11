@@ -104,8 +104,10 @@ static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
 fn count_drop(slot: u32) {
     if let Some(counter) = DROPS.get_ptr_mut(slot) {
         // Per-CPU slot, and BPF programs do not migrate mid-run, so a plain
-        // read-modify-write cannot race.
-        unsafe { *counter += 1 };
+        // read-modify-write cannot race. `wrapping_add`, never `+=`: the BPF
+        // profile builds with overflow-checks on, and `+=` would drag in a
+        // panic path the verifier rejects ("last insn is not an exit or jmp").
+        unsafe { *counter = (*counter).wrapping_add(1) };
     }
 }
 
