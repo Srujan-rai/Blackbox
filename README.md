@@ -231,13 +231,14 @@ blackbox report /tmp/incident.json --perfetto > /tmp/incident.perfetto.json
 blackbox stop
 ```
 
-A real `blackbox status` from a running daemon:
+A real `blackbox status` from a running daemon (`scripts/demo.sh` on kernel
+7.0, mid-load):
 
 ```
 blackboxd status
   running         true
-  pid             72205
-  uptime          5s
+  pid             2604084
+  uptime          1s
   socket          /run/blackbox/blackboxd.sock
   dump dir        /var/lib/blackbox/dumps
 
@@ -246,45 +247,65 @@ bpf collection    attached
 
 ring buffer
   events retained 250000
-  history evicted 2152997
+  history evicted 74623
   kernel drops    0
 
 last trigger      none yet
 ```
 
-And the matching `blackbox report`:
+And the matching `blackbox report` (trimmed to the top rows):
 
 ```
 blackbox trace
 --------------
-  trigger         manual
-  window          0.512s
-  host            b0a323c6f565 (6.8.0-146-generic)
+  trigger          manual
+  window           1.008s
+  host             <hostname> (7.0.0-42-generic)
 
 completeness
 ------------
-  events          250000
-  on-cpu slices   249999
-  kernel drops    0
+  events           250000
+  on-cpu slices    249999
+  kernel drops     0
+  history evicted  75079
+  lifecycle events 8351
 
 top cpu consumers
 -----------------
-   63.72%       2.56s  pid 0        swapper/3
-   10.91%     438.9ms  pid 72208    trigger-poller
-    6.38%     256.5ms  pid 72207    bpf-collector
-    3.88%     155.9ms  pid 18589    gnome-terminal-
-    3.34%     134.2ms  pid 17068    brave
+  cpu busy 65.3%, idle 34.7% of observed cpu time
+
+    5.97%     392.0ms  pid 2604087  bpf-collector
+    5.68%     373.3ms  pid 2591860  brave
+    3.37%     221.4ms  pid 2604305  xargs
+    2.24%     147.0ms  pid 2591875  ThreadPoolForeg
 
 longest scheduler delays
 ------------------------
   time a runnable task spent waiting for a cpu
 
-       2.0ms  pid 0        swapper/3
-       1.8ms  pid 69434    dav1d-worker
+       7.3ms  pid 2604340  sh
+       5.1ms  pid 2604337  sh
+       5.1ms  pid 2604353  xargs
+
+most blocked time
+-----------------
+  time tasks spent blocked, i.e. waiting on something other than a cpu
+
+     818.1ms  pid 2471680  kworker/1:0
+     816.0ms  pid 15       rcu_preempt
+     808.2ms  pid 2616     pipewire-pulse
+
+process lifecycle
+-----------------
+  counts           2793 fork, 2776 exec, 2782 exit
+
+  exec:  /usr/bin/grep (pid 2606924)
+  fork:  zsh (pid 3286100) -> zsh (pid 2606924)
 ```
 
-(Note `trigger-poller` and `bpf-collector` in the ranking — that is the daemon
-measuring itself.)
+The idle task (`swapper`, pid 0) is reported as the idle share rather than as
+a consumer, and the delays are the demo's `sh`/`xargs` load waiting for a
+CPU. `bpf-collector` near the top is the daemon measuring itself.
 
 ## CLI reference
 
