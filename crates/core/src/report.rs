@@ -46,7 +46,7 @@ pub fn render_report_with(dump: &Dump, opts: ReportOptions) -> String {
     busiest_blocked(&mut out, &gaps, opts);
     lifecycle_section(&mut out, dump, opts);
     if opts.per_cpu {
-        per_cpu_table(&mut out, &slices, opts);
+        per_cpu_table(&mut out, &slices);
     }
 
     out
@@ -62,7 +62,10 @@ fn header(out: &mut String, dump: &Dump) {
         "window",
         &format!("{:.3}s", ns_to_s(dump.window.span_ns)),
     );
-    if !dump.window.truncated {
+    // An empty window has 0/0 monotonic endpoints, which would "cover" the
+    // boot instant; there is no real interval to date.
+    let has_window = !(dump.events.is_empty() && dump.lifecycle.is_empty());
+    if !dump.window.truncated && has_window {
         kv(
             out,
             "covering",
@@ -133,8 +136,25 @@ fn integrity(out: &mut String, dump: &Dump, slices: &[OnCpuSlice]) {
 
 fn top_consumers(out: &mut String, slices: &[OnCpuSlice], opts: ReportOptions) {
     rule(out, "top cpu consumers");
+    // Percentages are of all observed CPU time, idle included, so they read
+    // as "share of the machine". The idle task itself is not a consumer: it
+    // is reported as the idle remainder instead of topping the table.
+    let capacity_ns: u64 = slices.iter().map(OnCpuSlice::duration_ns).sum();
+    let idle_ns: u64 = slices
+        .iter()
+        .filter(|s| s.is_idle())
+        .map(OnCpuSlice::duration_ns)
+        .sum();
+    let pct_of = |ns: u64| {
+        if capacity_ns == 0 {
+            0.0
+        } else {
+            (ns as f64 / capacity_ns as f64) * 100.0
+        }
+    };
+
     let mut totals: HashMap<u32, (String, u64)> = HashMap::new();
-    for s in slices {
+    for s in slices.iter().filter(|s| !s.is_idle()) {
         let e = totals.entry(s.pid).or_insert_with(|| (s.comm.clone(), 0));
         e.1 += s.duration_ns();
     }
@@ -142,21 +162,22 @@ fn top_consumers(out: &mut String, slices: &[OnCpuSlice], opts: ReportOptions) {
         .into_iter()
         .map(|(pid, (comm, ns))| (pid, comm, ns))
         .collect();
-    rows.sort_by_key(|r| Reverse(r.2));
+    // pid breaks ties so the same dump always renders the same report.
+    rows.sort_by_key(|r| (Reverse(r.2), r.0));
 
-    let total_ns: u64 = rows.iter().map(|r| r.2).sum();
     if rows.is_empty() {
         out.push_str("  no on-cpu activity recorded\n\n");
         return;
     }
+    out.push_str(&format!(
+        "  cpu busy {:.1}%, idle {:.1}% of observed cpu time\n\n",
+        100.0 - pct_of(idle_ns),
+        pct_of(idle_ns)
+    ));
     for (pid, comm, ns) in rows.iter().take(opts.top) {
-        let pct = if total_ns == 0 {
-            0.0
-        } else {
-            (*ns as f64 / total_ns as f64) * 100.0
-        };
         out.push_str(&format!(
-            "  {pct:6.2}%  {:>10}  pid {pid:<8} {comm}\n",
+            "  {:6.2}%  {:>10}  pid {pid:<8} {comm}\n",
+            pct_of(*ns),
             fmt_dur(*ns)
         ));
     }
@@ -197,7 +218,7 @@ fn busiest_blocked(out: &mut String, gaps: &[TaskGap], opts: ReportOptions) {
         .into_iter()
         .map(|(pid, (comm, ns))| (pid, comm, ns))
         .collect();
-    rows.sort_by_key(|r| Reverse(r.2));
+    rows.sort_by_key(|r| (Reverse(r.2), r.0));
     if rows.is_empty() {
         out.push_str("  none recorded\n\n");
         return;
@@ -213,16 +234,32 @@ fn busiest_blocked(out: &mut String, gaps: &[TaskGap], opts: ReportOptions) {
     out.push('\n');
 }
 
-fn per_cpu_table(out: &mut String, slices: &[OnCpuSlice], opts: ReportOptions) {
+fn per_cpu_table(out: &mut String, slices: &[OnCpuSlice]) {
     rule(out, "per-cpu");
-    let mut per: HashMap<u32, u64> = HashMap::new();
+    // Every CPU is listed: --top limits rankings, and silently dropping
+    // CPUs past 16 on a large box would hide the hot one.
+    // (busy, observed): idle-task time counts toward what was observed on the
+    // CPU but not toward busy, otherwise every CPU reads as 100% busy.
+    let mut per: HashMap<u32, (u64, u64)> = HashMap::new();
     for s in slices {
-        *per.entry(s.cpu).or_default() += s.duration_ns();
+        let e = per.entry(s.cpu).or_default();
+        e.1 += s.duration_ns();
+        if !s.is_idle() {
+            e.0 += s.duration_ns();
+        }
     }
-    let mut rows: Vec<(u32, u64)> = per.into_iter().collect();
+    let mut rows: Vec<(u32, (u64, u64))> = per.into_iter().collect();
     rows.sort_by_key(|(cpu, _)| *cpu);
-    for (cpu, ns) in rows.iter().take(opts.top.max(16)) {
-        out.push_str(&format!("  cpu {cpu:<4} {:>10} busy\n", fmt_dur(*ns)));
+    for (cpu, (busy, observed)) in rows.iter() {
+        let pct = if *observed == 0 {
+            0.0
+        } else {
+            (*busy as f64 / *observed as f64) * 100.0
+        };
+        out.push_str(&format!(
+            "  cpu {cpu:<4} {:>10} busy  {pct:5.1}%\n",
+            fmt_dur(*busy)
+        ));
     }
     out.push('\n');
 }
@@ -616,5 +653,39 @@ mod tests {
         let s = format_wall(now_unix_ns());
         assert!(s.starts_with("20"), "got {s}");
         assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn idle_task_is_reported_as_idle_not_as_a_consumer_or_a_delay() {
+        // swapper (pid 0) runs 0..8s, task1 8..10s, then swapper again.
+        let d = dump(
+            vec![
+                ev(0, 0, 999, 0, 1),
+                ev(8 * NS, 0, 0, 1, 0),
+                ev(10 * NS, 0, 1, 0, 1),
+                ev(11 * NS, 0, 0, 1, 0),
+            ],
+            12 * NS,
+        );
+        let r = render_report_with(
+            &d,
+            ReportOptions {
+                top: 10,
+                per_cpu: true,
+            },
+        );
+        let top = section(&r, "top cpu consumers", "longest scheduler delays");
+        assert!(!top.contains("pid 0 "), "idle is not a consumer: {top}");
+        assert!(top.contains("idle 75.0%"), "got: {top}");
+        let delays = section(&r, "longest scheduler delays", "most blocked time");
+        assert!(!delays.contains("pid 0 "), "idle is not latency: {delays}");
+        let per_cpu = section(&r, "per-cpu", "\u{0}");
+        assert!(per_cpu.contains(" 25.0%"), "busy excludes idle: {per_cpu}");
+    }
+
+    #[test]
+    fn an_empty_dump_does_not_claim_to_cover_the_boot_instant() {
+        let r = render_report(&dump(Vec::new(), 0));
+        assert!(!r.contains("covering"), "got: {r}");
     }
 }

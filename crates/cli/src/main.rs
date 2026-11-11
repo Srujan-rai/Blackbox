@@ -93,6 +93,17 @@ fn daemon_command() -> Command {
 
 /// Start the daemon and confirm it is accepting requests.
 fn start(config: &Path, foreground: bool) -> Result<()> {
+    // A daemon that already answers would otherwise make the readiness probe
+    // below report the *old* daemon as freshly started.
+    if let Ok(Response::Status(info)) = send_request(&Request::Status) {
+        anyhow::bail!(
+            "blackboxd is already running (pid {}) on {}; `blackbox stop` it first",
+            info.pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".into()),
+            info.socket
+        );
+    }
     let mut cmd = daemon_command();
     cmd.arg("--config").arg(config);
 
@@ -115,11 +126,7 @@ fn start(config: &Path, foreground: bool) -> Result<()> {
     // A detached daemon still needs somewhere to write its logs, since nobody
     // is holding its stderr. Prefer the system log directory and fall back to
     // /tmp the same way the socket binding does.
-    let log_path = open_log()?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let (log_path, log) = open_log()?;
     let log_err = log.try_clone()?;
     let mut child = cmd
         .stdin(Stdio::null())
@@ -162,14 +169,27 @@ fn start(config: &Path, foreground: bool) -> Result<()> {
     Err(anyhow::anyhow!("blackboxd did not come up: {last_err}"))
 }
 
-/// Pick a writable log file for a detached daemon.
-fn open_log() -> Result<PathBuf> {
+/// Open a writable log file for a detached daemon.
+///
+/// Each candidate is judged by actually opening the file, not by whether its
+/// directory exists: after one `sudo blackbox start`, `/var/log/blackbox` is
+/// root-owned, and a later unprivileged start must fall through to `/tmp`
+/// instead of failing with a bare "Permission denied".
+fn open_log() -> Result<(PathBuf, fs::File)> {
+    let mut errors = Vec::new();
     for dir in ["/var/log/blackbox", "/tmp"] {
-        if fs::create_dir_all(dir).is_ok() {
-            return Ok(PathBuf::from(dir).join("blackboxd.log"));
+        let path = PathBuf::from(dir).join("blackboxd.log");
+        let opened = fs::create_dir_all(dir)
+            .and_then(|_| fs::OpenOptions::new().create(true).append(true).open(&path));
+        match opened {
+            Ok(file) => return Ok((path, file)),
+            Err(e) => errors.push(format!("  {}: {e}", path.display())),
         }
     }
-    Err(anyhow::anyhow!("no writable directory for daemon logs"))
+    Err(anyhow::anyhow!(
+        "no writable log file for the daemon:\n{}",
+        errors.join("\n")
+    ))
 }
 
 fn print_status(info: StatusInfo) {
@@ -225,6 +245,12 @@ fn print_status(info: StatusInfo) {
     } else {
         println!("  kernel drops    0");
     }
+    if info.lifecycle_dropped_kernel > 0 {
+        println!(
+            "  lifecycle drops {} (fork/exec/exit events lost)",
+            info.lifecycle_dropped_kernel
+        );
+    }
     println!();
     match (&info.last_trigger_reason, info.last_trigger_time) {
         (Some(reason), Some(ts)) => println!("last trigger      {reason} at unix {ts}ns"),
@@ -276,7 +302,14 @@ fn main() -> Result<()> {
             _ => anyhow::bail!("unexpected response from daemon"),
         },
         Cmd::Dump { output } => {
-            let output_str = output.as_ref().map(|p| p.to_string_lossy().to_string());
+            // The daemon resolves paths against its own working directory
+            // (`/` under systemd), so a relative -o must be made absolute
+            // here, against the caller's.
+            let output_str = output
+                .as_deref()
+                .map(std::path::absolute)
+                .transpose()?
+                .map(|p| p.to_string_lossy().to_string());
             match send_request(&Request::Dump { output: output_str })? {
                 Response::Dump(result) => {
                     if !result.success {

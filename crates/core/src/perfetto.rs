@@ -38,7 +38,11 @@ pub fn to_chrome_json(dump: &Dump) -> Result<String, serde_json::Error> {
 }
 
 pub fn to_chrome_json_with(dump: &Dump, opts: ExportOptions) -> Result<String, serde_json::Error> {
-    let all = dump.slices();
+    // The idle task (pid 0) runs on every CPU at once. Emitted on one track
+    // its slices overlap, which Chrome JSON cannot represent (X events on a
+    // thread must nest), so Perfetto mangles or drops them. Idle reads
+    // clearly as the gaps in the real tasks' tracks instead.
+    let all: Vec<OnCpuSlice> = dump.slices().into_iter().filter(|s| !s.is_idle()).collect();
     let (kept, dropped) = trim(&all, opts.max_slices);
     let base_ns = dump.window.start_monotonic_ns;
 
@@ -77,7 +81,9 @@ pub fn to_chrome_json_with(dump: &Dump, opts: ExportOptions) -> Result<String, s
             "ph": "X",
             // Chrome trace timestamps are microseconds.
             "ts": ns_to_us(s.start_ns.saturating_sub(base_ns)),
-            "dur": ns_to_us(s.duration_ns()).max(1),
+            // Fractional microseconds keep sub-µs slices distinct; integer
+            // truncation made adjacent short slices overlap and nest wrongly.
+            "dur": ns_to_us(s.duration_ns()).max(0.001),
             "pid": s.pid,
             "tid": s.pid,
             "args": { "cpu": s.cpu, "comm": s.comm },
@@ -147,8 +153,9 @@ pub fn to_chrome_json_with(dump: &Dump, opts: ExportOptions) -> Result<String, s
     serde_json::to_string(&trace)
 }
 
-fn ns_to_us(ns: u64) -> u64 {
-    ns / 1_000
+/// Chrome trace timestamps are microseconds and may be fractional.
+fn ns_to_us(ns: u64) -> f64 {
+    ns as f64 / 1_000.0
 }
 
 /// Drop the oldest slices once over budget, reporting how many went.
@@ -255,18 +262,18 @@ mod tests {
             .iter()
             .find(|e| e["ph"] == "X")
             .unwrap();
-        assert_eq!(first["ts"], 0);
-        assert_eq!(first["dur"], 1_000_000);
+        assert_eq!(first["ts"].as_f64(), Some(0.0));
+        assert_eq!(first["dur"].as_f64(), Some(1_000_000.0));
     }
 
     #[test]
-    fn zero_length_slices_still_get_one_microsecond() {
+    fn zero_length_slices_still_get_a_positive_duration() {
         // Perfetto drops zero-duration X events, which would silently lose data.
         let d = dump_with(vec![ev(0, 0, 999, 1, 1), ev(0, 0, 1, 2, 0)], 0);
         let v = parse(&to_chrome_json(&d).unwrap());
         for e in v["traceEvents"].as_array().unwrap() {
             if e["ph"] == "X" {
-                assert!(e["dur"].as_u64().unwrap() >= 1);
+                assert!(e["dur"].as_f64().unwrap() > 0.0);
             }
         }
     }
@@ -295,7 +302,7 @@ mod tests {
             .iter()
             .find(|e| e["name"].as_str().unwrap().starts_with("trigger:"))
             .expect("trigger marker");
-        assert_eq!(t["ts"], 3_000_000);
+        assert_eq!(t["ts"].as_f64(), Some(3_000_000.0));
         assert_eq!(t["args"]["detail"], "test");
     }
 
@@ -377,7 +384,7 @@ mod tests {
         let ev = instants[0];
         assert!(ev["name"].as_str().unwrap().starts_with("exit: worker"));
         assert_eq!(ev["pid"], 9);
-        assert_eq!(ev["ts"], 1_000_000);
+        assert_eq!(ev["ts"].as_f64(), Some(1_000_000.0));
         assert_eq!(ev["args"]["prio"], 120);
     }
 
@@ -395,5 +402,42 @@ mod tests {
             to_chrome_json(&sample()).unwrap(),
             to_chrome_json(&sample()).unwrap()
         );
+    }
+
+    #[test]
+    fn sub_microsecond_timing_survives_export() {
+        let d = dump_with(
+            vec![
+                ev(0, 0, 999, 1, 1),
+                ev(1_500, 0, 1, 2, 0),
+                ev(2_250, 0, 2, 1, 0),
+            ],
+            3_000,
+        );
+        let v = parse(&to_chrome_json(&d).unwrap());
+        let durs: Vec<f64> = v["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["ph"] == "X")
+            .map(|e| e["dur"].as_f64().unwrap())
+            .collect();
+        assert_eq!(durs, vec![1.5, 0.75, 0.75]);
+    }
+
+    #[test]
+    fn idle_task_slices_are_not_exported() {
+        let d = dump_with(
+            vec![ev(0, 0, 999, 0, 1), ev(0, 1, 999, 0, 1), ev(NS, 0, 0, 5, 0)],
+            2 * NS,
+        );
+        let v = parse(&to_chrome_json(&d).unwrap());
+        let idle = v["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["ph"] == "X" && e["pid"] == 0)
+            .count();
+        assert_eq!(idle, 0);
     }
 }

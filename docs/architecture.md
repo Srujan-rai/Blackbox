@@ -96,10 +96,17 @@ A task is *on CPU* on `c` from the switch that made it `next` until the switch
 that makes it `prev`. Consecutive records are paired per CPU to produce those
 intervals; the `prev_state` on the closing record says why the task left:
 
-- `prev_state == 0` — still runnable, so this is **scheduler delay**: the task
-  wanted the CPU and did not get it.
+- still runnable, so this is **scheduler delay**: the task wanted the CPU and
+  did not get it. That is `prev_state & 0x100` (`TASK_REPORT_MAX`, the
+  kernel's marker for an involuntary preemption, shown as `R+` by ftrace) or
+  `prev_state == 0` (a voluntary yield). Preemption is the common case;
+  testing only for 0 misfiles it as blocking.
 - anything else — the task **blocked** (sleep, I/O, …), which is *not* a
   scheduling problem and is reported separately.
+
+pid 0 is the per-CPU idle task: every CPU has one, so it is "on CPU" in
+parallel and is excluded from rankings, latency and the Perfetto tracks, and
+reported as idle time instead.
 
 This is why the CPU id is stamped in BPF: it is not in the tracepoint payload,
 and intervals cannot be rebuilt per CPU without it.
@@ -124,8 +131,13 @@ source of those numbers and they are checked in review.
 The same discipline applies to the second record, `Lifecycle`
 (`blackbox_core::lifecycle::LifecycleRecord`, also 64 bytes):
 
-- `sched_process_fork` — `parent_comm` 8, `parent_pid` 24, `child_comm` 28,
-  `child_pid` 44.
+- `sched_process_fork` — the layout differs across kernels: older ones store
+  both comms inline (`child_pid` at 44), newer ones as `__data_loc` strings
+  (`child_pid` at 20), and a fixed offset reads string bytes as pids. So the
+  parent's pid and comm come from helpers (the tracepoint fires in the
+  parent), the child's comm is the parent's, and the daemon parses
+  `child_pid`'s offset from the event's `format` file into the `FORK_LAYOUT`
+  map before attaching (default 44 if unreadable).
 - `sched_process_exec` — `filename` (a `__data_loc` whose low 16 bits are the
   byte offset of the string inside the record) 8, `pid` 12, `old_pid` 16. The
   string is read with `bpf_probe_read_kernel_str` at that dynamic offset and

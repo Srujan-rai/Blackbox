@@ -430,6 +430,16 @@ impl Config {
                 self.bpf.filter_pids.len()
             )));
         }
+        // pid 0 is the idle task, on one side of a large share of all
+        // switches: listing it would quietly turn the filter back into
+        // machine-wide tracing, defeating the reason to set one.
+        if self.bpf.filter_pids.contains(&0) {
+            return Err(ConfigError::Invalid(
+                "bpf.filter_pids contains 0 (the idle task), which would match nearly every \
+                 context switch; list real pids only"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -793,5 +803,12 @@ mod tests {
         assert!(msg.contains("/nope/a.o") && msg.contains("/nope/b.o"));
         assert!(msg.contains(BPF_OBJECT_ENV));
         assert!(msg.contains("[bpf].object_path"));
+    }
+
+    #[test]
+    fn filter_pids_rejects_the_idle_task() {
+        let cfg = Config::from_toml("[bpf]\nfilter_pids = [0, 42]\n").unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("idle task"), "got: {err}");
     }
 }

@@ -7,10 +7,31 @@ use std::mem::offset_of;
 /// always reserved, so a comm is at most 15 characters.
 pub const COMM_LEN: usize = 16;
 
-/// `prev_state == 0` means the task was still runnable when it was switched out,
-/// i.e. it was preempted rather than blocked. This distinction is what lets the
-/// report separate scheduler latency from time spent blocked on I/O or sleep.
+/// `prev_state == 0` means the task was still runnable when it voluntarily gave
+/// up the CPU (`sched_yield`, or the idle task handing over). See
+/// [`is_runnable_state`] for the full "still runnable" test.
 pub const TASK_RUNNING: i64 = 0;
+
+/// The bit the kernel reports in `prev_state` for an *involuntary* preemption.
+///
+/// `__trace_sched_switch_state()` ignores the task state on preemption and
+/// returns `TASK_REPORT_MAX` instead (ftrace renders it as `R+`). It has been
+/// `0x100` since Linux 4.14 (`TASK_REPORT` is `0x7f`, `TASK_REPORT_IDLE` is
+/// `0x80`, and `TASK_REPORT_MAX` is the next bit up), which covers every
+/// kernel blackbox supports. This is the common case of a runnable task
+/// losing its CPU, so missing it misfiles real scheduler latency as blocking.
+pub const TASK_REPORT_MAX: i64 = 0x100;
+
+/// True when a task switched out in `prev_state` was still runnable, meaning
+/// the time until it next runs is scheduler latency rather than blocking.
+pub fn is_runnable_state(prev_state: i64) -> bool {
+    prev_state == TASK_RUNNING || prev_state & TASK_REPORT_MAX != 0
+}
+
+/// pid 0 is the per-CPU idle task (`swapper/N`). Every CPU has one, all with
+/// pid 0, so it is "on CPU" in parallel everywhere and is not a workload: it
+/// is excluded from rankings and latency, and counted as idle time instead.
+pub const IDLE_PID: u32 = 0;
 
 /// A single `sched_switch` observation.
 ///
@@ -98,7 +119,7 @@ impl SchedSwitch {
     /// True when the outgoing task was still runnable, i.e. it lost the CPU
     /// rather than blocking.
     pub fn was_preempted(&self) -> bool {
-        self.prev_state == TASK_RUNNING
+        is_runnable_state(self.prev_state)
     }
 }
 

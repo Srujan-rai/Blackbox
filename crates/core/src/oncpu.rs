@@ -19,7 +19,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
-use crate::event::{SchedSwitch, TASK_RUNNING};
+use crate::event::{is_runnable_state, SchedSwitch, IDLE_PID};
 
 /// One uninterrupted stretch of wall time a task held a CPU.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +42,12 @@ impl OnCpuSlice {
     /// True when the task lost the CPU while still runnable, i.e. it was
     /// preempted rather than blocked.
     pub fn was_preempted(&self) -> bool {
-        self.end_state == Some(TASK_RUNNING)
+        self.end_state.is_some_and(is_runnable_state)
+    }
+
+    /// True for the per-CPU idle task (pid 0, `swapper/N`).
+    pub fn is_idle(&self) -> bool {
+        self.pid == IDLE_PID
     }
 }
 
@@ -166,37 +171,50 @@ fn push_slice(out: &mut Vec<OnCpuSlice>, prev: &mut Option<OnCpuSlice>, slice: O
 /// A gap is runnable when the task was preempted on the way out, and blocked
 /// otherwise. Sorting by start makes each task's intervals a proper sequence, so
 /// only genuine gaps are emitted rather than overlaps.
+///
+/// The idle task is skipped: pid 0 runs on every CPU at once, so "gaps"
+/// between its slices on different CPUs are artefacts, and an idle CPU
+/// waiting for work is not scheduler latency.
 pub fn gaps(slices: &[OnCpuSlice]) -> Vec<TaskGap> {
     let mut per_pid: HashMap<u32, Vec<&OnCpuSlice>> = HashMap::new();
-    for s in slices {
+    for s in slices.iter().filter(|s| !s.is_idle()) {
         per_pid.entry(s.pid).or_default().push(s);
     }
 
     let mut out = Vec::new();
     for (pid, mut v) in per_pid {
         v.sort_by_key(|s| s.start_ns);
-        let comm = v.first().map(|s| s.comm.clone()).unwrap_or_default();
-        for w in v.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if b.start_ns <= a.end_ns {
-                continue;
+        let Some(&first) = v.first() else { continue };
+        let comm = first.comm.clone();
+        // Compare against the latest-ending slice so far, not just the
+        // previous one: a slice that overlaps (clock skew across CPUs during
+        // a migration) must not hide behind a shorter neighbour and open a
+        // phantom gap.
+        let mut latest = first;
+        for &b in &v[1..] {
+            if b.start_ns > latest.end_ns {
+                out.push(TaskGap {
+                    pid,
+                    comm: comm.clone(),
+                    start_ns: latest.end_ns,
+                    end_ns: b.start_ns,
+                    runnable: latest.was_preempted(),
+                });
             }
-            out.push(TaskGap {
-                pid,
-                comm: comm.clone(),
-                start_ns: a.end_ns,
-                end_ns: b.start_ns,
-                runnable: a.was_preempted(),
-            });
+            if b.end_ns >= latest.end_ns {
+                latest = b;
+            }
         }
     }
-    out.sort_by_key(|g| Reverse(g.duration_ns()));
+    // pid and start break ties so reports render deterministically.
+    out.sort_by_key(|g| (Reverse(g.duration_ns()), g.pid, g.start_ns));
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::TASK_RUNNING;
 
     const NS: u64 = 1_000_000_000;
 
@@ -383,6 +401,69 @@ mod tests {
                 end_ns: 20,
                 end_state: Some(0),
             },
+        ];
+        assert!(gaps(&slices).is_empty());
+    }
+
+    fn slice(pid: u32, cpu: u32, start_ns: u64, end_ns: u64, state: i64) -> OnCpuSlice {
+        OnCpuSlice {
+            pid,
+            comm: "t".into(),
+            cpu,
+            start_ns,
+            end_ns,
+            end_state: Some(state),
+        }
+    }
+
+    #[test]
+    fn involuntary_preemption_is_scheduler_latency() {
+        // The kernel reports a preempted task as TASK_REPORT_MAX ("R+"), not
+        // 0. Treating that as blocked would hide exactly the latency the
+        // report exists to show.
+        use crate::event::TASK_REPORT_MAX;
+        let events = vec![
+            ev(0, 0, 999, 1, 1),
+            ev(10 * NS, 0, 1, 2, TASK_REPORT_MAX),
+            ev(14 * NS, 0, 2, 1, 1),
+        ];
+        let slices = reconstruct(&events, 15 * NS);
+        let g = gaps(&slices);
+        let for_one = g.iter().find(|x| x.pid == 1).expect("gap for task 1");
+        assert!(for_one.runnable);
+        assert_eq!(for_one.duration_ns(), 4 * NS);
+    }
+
+    #[test]
+    fn sleeping_states_are_not_latency() {
+        // Interruptible (1), uninterruptible (2) and TASK_IDLE kthreads
+        // (TASK_REPORT_IDLE, 0x80) all block; none is scheduler latency.
+        for state in [1, 2, 0x80] {
+            assert!(!crate::event::is_runnable_state(state), "state {state:#x}");
+        }
+        assert!(crate::event::is_runnable_state(0));
+        assert!(crate::event::is_runnable_state(0x100));
+    }
+
+    #[test]
+    fn idle_task_never_produces_gaps() {
+        // pid 0 is on every CPU at once; its "gaps" are not latency.
+        let slices = vec![
+            slice(0, 0, 0, 10, 0),
+            slice(0, 1, 20, 30, 0),
+            slice(0, 0, 40, 50, 0),
+        ];
+        assert!(gaps(&slices).is_empty());
+    }
+
+    #[test]
+    fn a_long_slice_is_not_hidden_by_a_shorter_overlapping_one() {
+        // Slice b sits inside a; c starts after b ends but before a ends.
+        // There is no gap: the task was on CPU through a until 100.
+        let slices = vec![
+            slice(1, 0, 0, 100, 0),
+            slice(1, 1, 10, 20, 0),
+            slice(1, 1, 50, 120, 0),
         ];
         assert!(gaps(&slices).is_empty());
     }

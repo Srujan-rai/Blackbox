@@ -33,7 +33,8 @@ use blackbox_core::history::HistoryRing;
 use blackbox_core::ipc::{DumpResult, Request, Response, StatusInfo, StopResult};
 use blackbox_core::psi::PressureMonitor;
 use blackboxd::collect::{
-    lock_runtime, request_stop, run_collector, run_triggers, stop_requested, SharedRuntime,
+    dump_now, lock_runtime, request_stop, run_collector, run_triggers, stop_requested,
+    SharedRuntime,
 };
 use blackboxd::runtime::Runtime;
 use clap::Parser;
@@ -107,9 +108,10 @@ fn handle_client(
     let peer_uid = getsockopt::<_, PeerCredentials>(&stream, PeerCredentials)
         .map(|c| c.uid())
         .ok();
+    let privileged = mutations_allowed(peer_uid);
     let mutating_ok = {
         let rt = lock_runtime(runtime);
-        !rt.config().ipc.restrict_mutations || mutations_allowed(peer_uid)
+        !rt.config().ipc.restrict_mutations || privileged
     };
 
     let resp = match req {
@@ -123,11 +125,11 @@ fn handle_client(
                 uptime_secs: rt.uptime_secs(),
                 events_recorded: rt.history().len() as u64,
                 events_evicted: rt.history().evicted(),
-                // Not measured: aya's ring buffer API does not expose
-                // kernel-side drop counts to userspace (the failure is
-                // returned to the BPF program, which discards it), and an
-                // honest zero beats an invented number.
+                // Counted by the BPF program itself (the DROPS map), since
+                // aya's ring buffer API does not expose overflows. Reads 0
+                // with an object built before that map existed.
                 events_dropped_kernel: rt.kernel_drops(),
+                lifecycle_dropped_kernel: rt.lifecycle_kernel_drops(),
                 last_trigger_reason: rt.last_trigger_reason().clone(),
                 last_trigger_time: rt.last_trigger_time(),
                 socket: socket_path.to_string(),
@@ -147,12 +149,18 @@ fn handle_client(
                      rerun with sudo, or set [ipc].restrict_mutations = false"
                         .to_string(),
                 )
+            } else if let Err(reason) = check_output_path(output.as_deref(), privileged) {
+                Response::Error(reason)
             } else {
-                // The whole dump (snapshot, serialise, write, retention) runs
-                // under one lock: dumps are rare, and splitting Runtime to
-                // shorten the hold would cost more correctness than it buys.
-                // Status requests queue behind it; they do not fail.
-                match lock_runtime(runtime).dump_to(output.as_deref().map(Path::new)) {
+                // Only the window copy runs under the runtime lock; building
+                // and writing the JSON does not, so the collector keeps
+                // draining the kernel ring buffer while a dump is written.
+                match dump_now(
+                    runtime,
+                    "manual",
+                    Some("requested via CLI"),
+                    output.as_deref().map(Path::new),
+                ) {
                     Ok(path) => Response::Dump(DumpResult {
                         success: true,
                         path: Some(path.to_string_lossy().to_string()),
@@ -196,12 +204,52 @@ fn handle_client(
     Ok(())
 }
 
+/// Is an explicit `dump -o PATH` acceptable from this caller?
+///
+/// The daemon writes the file with its own (usually root) privileges, so a
+/// path chosen by somebody else is a file-overwrite primitive: only root or
+/// the daemon's owner may name one, even when `restrict_mutations = false`
+/// lets everyone trigger dumps into the dump directory. The path must also be
+/// absolute: a relative one would resolve against the daemon's working
+/// directory (`/` under systemd), not the caller's. The CLI absolutises paths
+/// before sending them.
+fn check_output_path(output: Option<&str>, privileged: bool) -> Result<(), String> {
+    let Some(output) = output else { return Ok(()) };
+    if !privileged {
+        return Err(
+            "permission denied: only the daemon owner or root may choose a dump path; \
+             omit -o to write into the configured dump directory"
+                .to_string(),
+        );
+    }
+    if !Path::new(output).is_absolute() {
+        return Err(format!(
+            "dump path {output:?} is relative; the daemon cannot know the caller's \
+             working directory, so send an absolute path"
+        ));
+    }
+    Ok(())
+}
+
 /// Bind the control socket, trying each known location in turn.
 ///
 /// `/run` needs root, and a developer run does not have it, so failure to bind
 /// the preferred path falls through to the next rather than aborting. The path
 /// that actually worked is what every later status line reports.
 fn bind_socket() -> anyhow::Result<(UnixListener, String)> {
+    // A socket that still answers belongs to a running daemon. Unlinking it
+    // would orphan that daemon (alive, tracing, unreachable) and run two
+    // collectors side by side, so refuse instead. Checked across every
+    // location first: a root daemon on /run must not start beside a
+    // developer daemon already answering on /tmp, either.
+    for path in blackbox_core::DEFAULT_SOCKET_PATHS.iter() {
+        if UnixStream::connect(path).is_ok() {
+            return Err(anyhow::anyhow!(
+                "another blackboxd is already listening on {path}; stop it first \
+                 (blackbox stop)"
+            ));
+        }
+    }
     for path in blackbox_core::DEFAULT_SOCKET_PATHS.iter() {
         // The CLI connects as the invoking user, not root, so the socket the
         // daemon creates must be reachable by non-root users too:
@@ -409,4 +457,28 @@ fn main() -> anyhow::Result<()> {
     let _ = fs::remove_file(PID_PATH);
     eprintln!("blackboxd: stopped (control socket and PID file removed)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_output_path_is_always_fine() {
+        assert!(check_output_path(None, false).is_ok());
+        assert!(check_output_path(None, true).is_ok());
+    }
+
+    #[test]
+    fn unprivileged_callers_cannot_choose_where_root_writes() {
+        let err = check_output_path(Some("/etc/passwd"), false).unwrap_err();
+        assert!(err.contains("permission denied"), "got: {err}");
+    }
+
+    #[test]
+    fn relative_paths_are_rejected() {
+        let err = check_output_path(Some("incident.json"), true).unwrap_err();
+        assert!(err.contains("relative"), "got: {err}");
+        assert!(check_output_path(Some("/tmp/incident.json"), true).is_ok());
+    }
 }
