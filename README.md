@@ -1,274 +1,40 @@
+<div align="center">
+
 # Blackbox
 
+**A flight recorder for the Linux scheduler.**
+
+Always on. Low overhead. When your machine stalls, the trace of what happened
+is already on disk.
+
 [![CI](https://github.com/Srujan-rai/Blackbox/actions/workflows/ci.yml/badge.svg)](https://github.com/Srujan-rai/Blackbox/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Srujan-rai/Blackbox?sort=semver)](https://github.com/Srujan-rai/Blackbox/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Linux 5.15+](https://img.shields.io/badge/linux-5.15%2B-informational)
+![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange)
 
-**A low-overhead, post-mortem trace recorder for the Linux scheduler.**
+[Website](https://srujan-rai.github.io/Blackbox/) ·
+[Quick start](#quick-start) ·
+[How it works](#how-it-works) ·
+[Docs](#documentation) ·
+[Releases](https://github.com/Srujan-rai/Blackbox/releases)
 
-Blackbox watches `sched_switch` with eBPF, keeps a rolling window of scheduling
-history in userspace, and writes a self-describing trace the moment pressure
-crosses a threshold (or when you ask). The trace opens in
-[ui.perfetto.dev](https://ui.perfetto.dev/) or renders as a plain-text report.
-
-> **Status:** v0.2 — the MVP plus per-event export, OOM and lifecycle triggers.
-> The BPF program has been loaded and verified end-to-end on a real kernel (see
-> [Testing](#testing)).
+</div>
 
 ---
 
-## Why
+When a box freezes, the interesting part is the half-second *before* anyone
+noticed: which tasks were runnable but could not get a CPU, who was holding
+it, what was stuck on I/O. By the time you attach `perf`, that moment is gone.
 
-When a machine stalls, the interesting thing is usually what happened in the
-half-second *before* you noticed — which tasks were runnable and couldn't get a
-CPU, who was holding it, what was stuck on I/O. By the time you attach `perf`,
-the moment is gone. Blackbox is always running, so the history is already
-there when the stall happens.
+Blackbox keeps a rolling window of every context switch using eBPF and writes
+a self-describing trace the instant CPU, memory or I/O pressure crosses a
+threshold, the OOM killer fires, or you ask for one. Read it as a plain-text
+report, or open it in [Perfetto](https://ui.perfetto.dev/).
 
-It is deliberately small: a handful of tracepoints, two ring buffers, one
-bounded window, a handful of triggers, and two export formats.
-
-## Features
-
-- **eBPF `sched_switch` capture** through a single tracepoint (no kprobes), via
-  [aya](https://aya-rs.dev/) and CO-RE. One object runs across compatible
-  kernels.
-- **Process lifecycle events** — `fork`, `exec` and `exit` are captured through
-  their own ring buffer (so the hot `sched_switch` path is untouched) and
-  appear in dumps, reports and the Perfetto export. For each `exec`, the
-  executed path is recorded (up to 15 characters, like a `comm`).
-- **Bounded history window** — the last *N* seconds capped by both an event
-  count and a duration, so memory use is predictable (default 250k events /
-  30s).
-- **PSI triggers** for CPU, memory and I/O pressure, polled from
-  `/proc/pressure`, with **hysteresis**: a trigger must stay over threshold for
-  a configurable number of consecutive samples and re-arms only once pressure
-  actually recedes. No dump storms.
-- **OOM-kill trigger** — watches the kernel's `oom_kill` counter in
-  `/proc/vmstat` and dumps the moment the OOM killer takes a victim, reporting
-  how many kills occurred in the burst. Needs no BPF.
-- **Native, lossless dumps** — JSON with a schema version, trigger reason,
-  host identity, window bounds (monotonic *and* wall-clock), and self-overhead
-  counters.
-- **Perfetto export** — `blackbox report --perfetto` emits Chrome JSON that
-  loads directly in [ui.perfetto.dev](https://ui.perfetto.dev/).
-- **Text report** — top CPU consumers, longest scheduler delays (time a
-  runnable task waited for a CPU), most blocked time, optional per-CPU
-  breakdown.
-- **Daemon + CLI over a Unix socket** — `start` / `status` / `dump` / `stop`, with a
-  `--foreground` mode for service managers.
-- **Graceful degradation** — if the BPF program can't load (no object, no
-  privileges, no BTF), the daemon keeps serving status, manual dumps and
-  trigger dumps (PSI + OOM), and `blackbox status` says exactly why collection
-  is off.
-- **Clean shutdown** on `SIGINT`/`SIGTERM`, removing the socket and PID file.
-- **Dump retention** — keep the newest *K* dumps, delete the rest.
-- **systemd unit** and an annotated example config.
-- **Reproducible demo and overhead benchmark** — [`scripts/demo.sh`](scripts/demo.sh)
-  runs the whole flow end to end; [`scripts/bench.sh`](scripts/bench.sh) measures
-  the daemon's cost on a scheduler-heavy workload (results in
-  [`docs/overhead.md`](docs/overhead.md)).
-
-## Scope
-
-**In (v0.2):** `sched_switch` + process lifecycle (fork/exec/exit); PSI
-(CPU/memory/IO) + OOM + manual triggers; bounded history; native dump (schema
-v2, and v1 traces still load); text and Perfetto reports; an optional PID
-filter that switches the daemon from machine-wide tracing to a few processes.
-
-**Deliberately out (for now):** I/O event sources (block queue latency),
-cgroup scoping or sampling, on-disk history across daemon restarts, a GUI,
-remote shipping. See [Limitations](#limitations) for the honest edges of what
-exists today.
-
-## How it works
-
-```
-        kernel                                   userspace (blackboxd)
-┌───────────────────────┐                ┌────────────────────────────────────┐
-│ sched/sched_switch    │  8 MB          │  collector thread                  │
-│ tracepoint ──► 64-byte│  ringbuf ────► │   decode ──► HistoryRing           │
-│ record (no helper)    │                │              (last N s / max count)│
-│                       │                │                                    │
-│ sched_process_fork    │  512 KB        │   decode ──► LifecycleRing         │
-│ sched_process_exec    │  ringbuf ────► │   fork / exec / exit               │
-│ sched_process_exit    │                │                                    │
-└───────────────────────┘                │  trigger poller thread ─► trigger ┐  │
-        /proc/pressure   ───────────────►│   hysteresis in PressureMonitor  │  │
-        /proc/vmstat     ───────────────►│   oom_kill counter in OomMonitor ▼  │
-                                         │  IPC thread (Unix socket) ──► write │
-      blackbox CLI ──(status/dump)──────►│   status · manual dump · retention  │
-                                         └────────────────────────────────────┘
-```
-
-Two design decisions matter:
-
-1. **The ring buffer is transport only; history lives in userspace.** A BPF
-   ring buffer cannot retain history — it overwrites with the newest events and
-   drops the oldest unread ones. So the actual "last *N* seconds" window is a
-   bounded `VecDeque` in `blackbox-core`, continuously refilled by the daemon.
-   The consequence, stated plainly: **history exists only while `blackboxd` is
-   running.**
-
-2. **All the hard logic is in pure, testable Rust.** Interval reconstruction,
-   ranking consumers, PSI hysteresis and report formatting live in
-   `blackbox-core`, which runs without privileges. The BPF program only stamps
-   a CPU id and copies fixed records into the ring buffers — a 64-byte
-   `sched_switch` record and a 64-byte lifecycle record, each with its own
-   buffer so the scheduler hot path never branches on an event tag.
-
-On-CPU intervals are rebuilt per CPU from consecutive switches, using
-`prev_state` to separate *scheduler latency* (a runnable task lost the CPU:
-preempted, which the kernel reports as `TASK_REPORT_MAX` / `R+`, or yielded,
-`prev_state == 0`) from *blocked time* (the task slept or waited on I/O). The
-per-CPU idle task (pid 0, `swapper/N`) is counted as idle time, not as a
-consumer or as latency.
-Lifecycle events ride in their own stream, so a fork storm or a respawning
-daemon is rendered as instant markers next to the scheduling picture.
-
-## Overhead
-
-Blackbox reads every `sched_switch`, so it is not free — its cost scales with
-the **machine-wide** context-switch rate, not with CPU load. Measured on an
-8-core host tracing a workload that does nothing but switch (400k switches per
-run):
-
-- the workload was slowed **+26–63 %** depending on the run — a noisy shared
-  host, so treat the range as indicative — i.e. **~0.6–1.7 µs added per switch**
-  the workload caused;
-- the daemon itself used **~0.6 of one core**, the stable figure across runs;
-- a **compute-bound** control was essentially untouched (blackbox runs no code
-  on compute);
-- adding the lifecycle tracepoints (fork/exec/exit) in v0.2 changed none of
-  this: their cost is inside the run-to-run jitter;
-- a **PID filter** is the mitigation for high-switch hosts: filtering to a pid
-  that never appears dropped the daemon from 0.6 cores to **~0.15 % of one
-  core** and the measured workload cost to ~+1.5–4.7 % (the tracepoint itself
-  still fires — the filter removes the ingest, not the hook).
-
-Writing that benchmark immediately found a real bug — a PSI poller that spun
-because a `continue` skipped its sleep — and fixing it cut daemon CPU from 1.6
-to 0.6 cores. Full method, raw numbers, caveats and the reproduction commands
-are in [`docs/overhead.md`](docs/overhead.md).
-
-### Memory & window
-
-All costs are bounded and predictable:
-
-- **Process memory (measured).** ~3.3 MB RSS in `--no-bpf` / development mode;
-  ~55 MB RSS with BPF collection attached on the reference host (kernel 6.8,
-  aya 0.14) — flat whether the history window is empty or at its 250k cap.
-- **Kernel side (fixed at compile time).** 8 MiB events ring buffer + 512 KiB
-  lifecycle ring buffer, plus a few KB of maps and the tracepoint programs.
-- **History window (userspace).** Starts at 512 KB (8192 × 64-byte slots) and
-  grows *lazily* to at most `max_events × 64 B` — up to 16 MB at the default
-  250,000 events.
-- **Window math.** The trace is `min(max_events / event-rate, max_seconds)`
-  wide. At 500k switches/s the default cap holds only ~0.5 s — precisely the
-  situation where you need the trace most. Raise `max_events` (memory follows
-  at 64 B per event), or cut ingest with `[bpf].filter_pids`; `max_seconds`
-  only widens already-quiet windows.
-
-## Requirements
-
-- **Linux 5.15 or newer** (BPF ring buffer + BTF + PSI). CO-RE needs
-  `/sys/kernel/btf/vmlinux`.
-- **Privileges:** loading/attaching BPF needs `CAP_BPF` + `CAP_PERFMON`, or
-  root. Reading PSI and running `blackbox report` need nothing special.
-- **To build:** stable Rust (workspace) plus nightly + `rust-src` and a static
-  [`bpf-linker`](https://github.com/aya-rs/bpf-linker) for the BPF crate.
-
-## Install
-
-### From a release
-
-Download the tarball for your architecture from
-[Releases](https://github.com/Srujan-rai/Blackbox/releases), verify it against
-the attached `.sha256`, and install:
-
-```sh
-tar -xzf blackbox-<version>-x86_64-unknown-linux-gnu.tar.gz
-cd blackbox-<version>-x86_64-unknown-linux-gnu
-sudo install -m755 blackbox blackboxd /usr/local/bin/
-sudo install -d /usr/local/lib/blackbox /etc/blackbox
-sudo install -m644 blackbox-bpf.o /usr/local/lib/blackbox/
-sudo install -m644 examples/config.toml /etc/blackbox/config.toml
-```
-
-### From source
-
-```sh
-# 1. BPF object (uses nightly + bpf-linker; installs ./blackbox-bpf.o)
-./crates/bpf/build.sh release
-
-# 2. CLI and daemon
-cargo build --release
-```
-
-`build.sh` writes the object to `crates/bpf/target/.../blackbox-bpf` and copies
-it to the repo root as `blackbox-bpf.o`, where the daemon looks by default. The
-non-obvious build flags are explained in
-[`crates/bpf/BUILD_NOTES.md`](crates/bpf/BUILD_NOTES.md).
-
-## Quick start
-
-```sh
-# Start the daemon (detached; --foreground to stay in this terminal)
-sudo blackbox start
-
-# Is it collecting? Retained events, history evictions, kernel drops, last trigger
-blackbox status
-
-# Take a trace now
-blackbox dump -o /tmp/incident.json
-
-# Read it as text…
-blackbox report /tmp/incident.json
-
-# …or open it in Perfetto
-blackbox report /tmp/incident.json --perfetto > /tmp/incident.perfetto.json
-# then drag it onto https://ui.perfetto.dev/
-
-# Shut the daemon down cleanly (joins workers, removes socket and PID file)
-blackbox stop
-```
-
-A real `blackbox status` from a running daemon (`scripts/demo.sh` on kernel
-7.0, mid-load):
-
-```
-blackboxd status
-  running         true
-  pid             2604084
-  uptime          1s
-  socket          /run/blackbox/blackboxd.sock
-  dump dir        /var/lib/blackbox/dumps
-
-bpf collection    attached
-  scope           machine-wide (no pid filter)
-
-ring buffer
-  events retained 250000
-  history evicted 74623
-  kernel drops    0
-
-last trigger      none yet
-```
-
-And the matching `blackbox report` (trimmed to the top rows):
-
-```
-blackbox trace
---------------
-  trigger          manual
-  window           1.008s
-  host             <hostname> (7.0.0-42-generic)
-
-completeness
-------------
-  events           250000
-  on-cpu slices    249999
-  kernel drops     0
-  history evicted  75079
-  lifecycle events 8351
+```console
+$ sudo blackbox start
+$ blackbox dump -o incident.json && blackbox report incident.json
 
 top cpu consumers
 -----------------
@@ -277,7 +43,6 @@ top cpu consumers
     5.97%     392.0ms  pid 2604087  bpf-collector
     5.68%     373.3ms  pid 2591860  brave
     3.37%     221.4ms  pid 2604305  xargs
-    2.24%     147.0ms  pid 2591875  ThreadPoolForeg
 
 longest scheduler delays
 ------------------------
@@ -289,248 +54,236 @@ longest scheduler delays
 
 most blocked time
 -----------------
-  time tasks spent blocked, i.e. waiting on something other than a cpu
-
      818.1ms  pid 2471680  kworker/1:0
      816.0ms  pid 15       rcu_preempt
-     808.2ms  pid 2616     pipewire-pulse
-
-process lifecycle
------------------
-  counts           2793 fork, 2776 exec, 2782 exit
-
-  exec:  /usr/bin/grep (pid 2606924)
-  fork:  zsh (pid 3286100) -> zsh (pid 2606924)
 ```
 
-The idle task (`swapper`, pid 0) is reported as the idle share rather than as
-a consumer, and the delays are the demo's `sh`/`xargs` load waiting for a
-CPU. `bpf-collector` near the top is the daemon measuring itself.
+<sub>Real output from <a href="scripts/demo.sh"><code>scripts/demo.sh</code></a> on kernel 7.0, trimmed. <code>bpf-collector</code> is Blackbox measuring itself.</sub>
 
-## CLI reference
+## Highlights
 
-| Command | Description |
-|---|---|
-| `blackbox start [--config PATH] [--foreground]` | Start the daemon (detached by default). |
-| `blackbox status` | Show daemon health, collection state, ring-buffer counters and last trigger. |
-| `blackbox dump [-o FILE]` | Trigger a manual dump (configured directory, or `-o`). |
-| `blackbox stop` | Shut the daemon down cleanly: workers joined, socket and PID file removed. |
-| `blackbox report FILE [--perfetto] [--top N] [--per-cpu]` | Text report, or Perfetto Chrome JSON with `--perfetto`. |
+- **Always recording.** A bounded window of the last *N* seconds of
+  `sched_switch` and fork/exec/exit events, with memory capped at 64 B per
+  event.
+- **Dumps itself when it matters.** PSI triggers for CPU, memory and I/O with
+  hysteresis (no dump storms), an OOM-kill trigger, or `blackbox dump` on
+  demand.
+- **Answers the real question.** Separates *scheduler latency* (runnable but
+  waiting for a CPU) from *blocked time* (sleeping or waiting on I/O), and
+  ranks who was eating the CPU.
+- **Opens in Perfetto.** `blackbox report --perfetto` emits Chrome JSON that
+  loads directly in [ui.perfetto.dev](https://ui.perfetto.dev/), with
+  per-task tracks and lifecycle markers.
+- **Honest about gaps.** Every dump records its own evictions and kernel-side
+  ring-buffer drops, so a lossy trace says so instead of looking complete.
+- **Degrades, never dies.** No BTF, no privileges, no object? The daemon keeps
+  serving status and trigger dumps, and `blackbox status` tells you why
+  collection is off.
+- **Small and safe by design.** One tracepoint on the hot path, no kprobes, no
+  network, CO-RE so one object runs across kernels.
 
-The CLI talks to the daemon over a Unix socket, trying
-`/run/blackbox/blackboxd.sock`, then `/var/run/...`, then `/tmp/blackboxd.sock`,
-so a non-root development run works. The daemon runs the control socket, a
-collector thread and a trigger-poller thread sharing one locked `Runtime`.
+## Quick start
 
-`blackboxd` itself takes `--config PATH` and `--no-bpf` (IPC + triggers only).
+**Requirements:** Linux 5.15+ with BTF (`/sys/kernel/btf/vmlinux`), and root
+or `CAP_BPF` + `CAP_PERFMON` to load the BPF program.
 
-## Configuration
+### Install a release
 
-`/etc/blackbox/config.toml` (see [`examples/config.toml`](examples/config.toml)).
-A missing file at the default path means defaults; a malformed one is a startup
-error — and unknown keys are rejected, so a typo never becomes a silent
-default.
+Download the tarball for your architecture from
+[Releases](https://github.com/Srujan-rai/Blackbox/releases) and check it
+against the attached `.sha256`:
 
-```toml
-[history]
-max_events  = 250000      # hard cap on retained events (~16 MB)
-max_seconds = 30          # cap on the window's width
-
-[pressure]
-poll_interval_ms = 250
-cpu    = { enabled = true, threshold_pct = 80.0, consecutive = 4 }
-memory = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
-io     = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
-oom    = { enabled = true }
-
-[dump]
-dir              = "/var/lib/blackbox/dumps"
-keep_last        = 10     # keep the newest N dumps; omit for unlimited
-timestamped_names = true
-
-[bpf]
-# object_path = "/usr/local/lib/blackbox/blackbox-bpf.o"
-# filter_pids = [1234, 5678]   # trace only these pids (max 32); empty = all
-
-[ipc]
-# restrict_mutations = true   # (default) dump/stop need the daemon owner or root;
-#                             # status is always open. false = any local user.
+```sh
+tar -xzf blackbox-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd blackbox-<version>-x86_64-unknown-linux-gnu
+sudo install -m755 blackbox blackboxd /usr/local/bin/
+sudo install -d /usr/local/lib/blackbox /etc/blackbox
+sudo install -m644 blackbox-bpf.o /usr/local/lib/blackbox/
+sudo install -m644 examples/config.toml /etc/blackbox/config.toml
 ```
 
-`consecutive` is the hysteresis: N samples over threshold before firing. After
-firing, a trigger re-arms only once the reading drops back below the threshold.
-`oom` has no threshold or window — any advance of the `oom_kill` counter fires.
+<details>
+<summary><b>Build from source</b></summary>
 
-The BPF object is located by, in order: `[bpf].object_path` (a missing file
-here is a startup error), then `BLACKBOX_BPF_OBJECT`, then
-`/usr/local/lib/blackbox/blackbox-bpf.o`, `/usr/lib/blackbox/blackbox-bpf.o`,
-`./blackbox-bpf.o`. If the search finds nothing, the daemon logs why, reports
-`bpf_attached: false` in `status`, and keeps serving.
+You need stable Rust, plus nightly with `rust-src` and a static
+[`bpf-linker`](https://github.com/aya-rs/bpf-linker) for the BPF crate.
 
-`[bpf].filter_pids` (a comma list of up to 32 pids; empty = every process) puts
-a pid filter into the kernel-side `FILTER` map at load time. A `sched_switch`
-record is only emitted when either side of the switch is in the list; a
-lifecycle event only when its subject is. The filter is fixed for the lifetime
-of the daemon (restart to change it) and the tracepoints still fire either
-way — what the filter removes is the ingest, decode and history cost, which is
-most of the daemon's CPU (see [Overhead](#overhead)).
+```sh
+./crates/bpf/build.sh release   # BPF object -> ./blackbox-bpf.o
+cargo build --release           # CLI and daemon -> target/release/
+```
 
-## Dump format
+The non-obvious BPF build flags are explained in
+[`crates/bpf/BUILD_NOTES.md`](crates/bpf/BUILD_NOTES.md).
 
-Dumps are native JSON with `schema_version: 2` (v1 traces still load). They are
-self-describing, so a trace from last week is still interpretable:
+</details>
 
-- `trigger` — `reason` (`manual`, `psi_cpu`, `psi_memory`, `psi_io`, `oom`) and
-  a human `detail`.
-- `window` — monotonic and wall-clock endpoints, span, and `truncated` when a
-  cap was hit.
-- `overhead` — `events_recorded`, `events_evicted` (our window's own
-  backpressure), `events_dropped_kernel`, plus `lifecycle_recorded` and
-  `lifecycle_evicted` for the process stream.
-- `host` — hostname, kernel release, boot id, uptime.
-- `events` — the `sched_switch` records (monotonic ns timestamps).
-- `lifecycle` (new in schema 2) — the fork/exec/exit events, each with `kind`,
-  `pid`, `peer_pid`, optional `value` (exit priority), `comm` and `name`
-  (child comm on fork, the executed path on exec).
+### Use it
 
-`blackbox report` validates the schema and event ordering before rendering.
-Kernel-side ring-buffer drops are counted by the BPF program itself (a
-per-CPU `DROPS` map, since aya's ring-buffer API does not expose overflows)
-and land in `events_dropped_kernel` / `lifecycle_dropped_kernel`. An object
-built before that map existed still loads; its drops read `0`.
+```sh
+sudo blackbox start                 # start the daemon (--foreground to stay attached)
+blackbox status                     # is it collecting? drops? last trigger?
 
-Dumps are written atomically (temporary file, then rename or link), so an
-interrupted write never leaves a truncated trace. Files in the dump directory
-are mode `0600`; an explicit `blackbox dump -o PATH` is `0644`, and the CLI
-resolves a relative `PATH` against your own working directory. Retention only
-ever deletes `blackbox.json` / `blackbox-*.json`.
+sudo blackbox dump -o incident.json # take a trace right now
+blackbox report incident.json       # read it as text
+blackbox report incident.json --perfetto > incident.perfetto.json
+                                    # ...or drag this onto ui.perfetto.dev
 
-## systemd
+sudo blackbox stop                  # clean shutdown
+```
 
-[`contrib/blackboxd.service`](contrib/blackboxd.service) runs the daemon with
-`RuntimeDirectory=blackbox` (so the socket and PID file have a place to live),
-`Restart=on-failure`, and a conservative sandbox (`NoNewPrivileges`,
-`ProtectSystem`, `ProtectHome`). Drop privileges by narrowing `User=` and the
-capability set once your deployment's needs are known.
+Triggered dumps land in `/var/lib/blackbox/dumps/` on their own. They are
+owner-only (`0600`), so read them with `sudo blackbox report ...`.
+
+### Run it as a service
 
 ```sh
 sudo install -m644 contrib/blackboxd.service /etc/systemd/system/
-sudo install -m644 examples/config.toml /etc/blackbox/config.toml
 sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
 ```
 
-## Privileges, privacy and threat model
+The unit uses `RuntimeDirectory=blackbox`, `Restart=on-failure` and a
+conservative sandbox (`NoNewPrivileges`, `ProtectSystem`, `ProtectHome`).
 
-- **Least privilege.** Loading and attaching BPF is the only privileged act.
-  The daemon can be run as root or with `CAP_BPF` + `CAP_PERFMON`; PSI reads
-  and all report generation need no capabilities.
-- **Privacy.** Blackbox records only what the kernel puts in the scheduler
-  tracepoints: the 15-character `comm` for switch/exit events, PIDs, the
-  previous task state, a timestamp and a CPU id. The process-lifecycle
-  tracepoints add a child's `comm` on `fork` and the **executed path** on
-  `exec` (up to 15 characters, e.g. `/usr/bin/psql`). It does **not** capture
-  command lines, arguments, environment variables or memory contents.
-- **No network.** The daemon neither listens on nor dials a network socket; it
-  speaks line-delimited JSON over a local Unix socket, one request per
-  connection.
-- **The control socket is local, not private.** The daemon creates it mode
-  `0666`, so any local user can read `blackbox status`. The mutating requests —
-  `blackbox dump` and `blackbox stop` — are gated by default (v0.2.3+) to the
-  daemon's owner and root via `SO_PEERCRED`, so an unprivileged user on a
-  shared box cannot read scheduling traces or stop collection; set
-  `[ipc].restrict_mutations = false` to widen them to every local user. An
-  environment that wants even `status` restricted can pre-create
-  `/run/blackbox` with a stricter mode — the daemon never tightens a directory
-  it did not create. Dumps in the dump directory are written `0600`, and only
-  root or the daemon owner may choose an explicit `-o` path (the daemon writes
-  it with its own privileges), even when `restrict_mutations = false`.
-- **Self-describing honesty.** Dumps carry their own completeness counters, so
-  a trace that lost events says so rather than looking authoritative.
+## Commands
+
+| Command | What it does |
+|---|---|
+| `blackbox start [--config PATH] [--foreground]` | Start the daemon (detached by default) |
+| `blackbox status` | Health, collection state, window counters, kernel drops, last trigger |
+| `blackbox dump [-o FILE]` | Write a trace now, to the dump directory or `FILE` |
+| `blackbox report FILE [--perfetto] [--top N] [--per-cpu]` | Text report, or Perfetto JSON |
+| `blackbox stop` | Shut down cleanly: workers joined, socket and PID file removed |
+
+`blackboxd` itself takes `--config PATH` and `--no-bpf` (status and triggers
+only, handy for development).
+
+## Configuration
+
+Defaults work out of the box. The settings you are most likely to touch:
+
+```toml
+[history]
+max_events  = 250000    # window size; ~16 MB. Raise it on busy hosts
+max_seconds = 30
+
+[pressure]
+memory = { enabled = true, threshold_pct = 20.0, consecutive = 4 }
+
+[dump]
+keep_last = 10          # retention
+
+[bpf]
+# filter_pids = [1234]  # trace only these pids to cut overhead
+```
+
+See [docs/configuration.md](docs/configuration.md) for every option.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph kernel["Kernel (eBPF)"]
+        SW["sched_switch"] --> RB1[("events ringbuf<br/>8 MiB")]
+        LC["fork / exec / exit"] --> RB2[("lifecycle ringbuf<br/>512 KiB")]
+    end
+    subgraph daemon["blackboxd"]
+        COL["collector"] --> HR["bounded history<br/>last N s / max events"]
+        TRG["trigger poller<br/>PSI + OOM"] --> DUMP["dump writer"]
+        IPC["control socket"] --> DUMP
+        HR --> DUMP
+    end
+    RB1 --> COL
+    RB2 --> COL
+    PSI["/proc/pressure<br/>/proc/vmstat"] --> TRG
+    CLI["blackbox CLI"] --> IPC
+    DUMP --> FILE["dump.json"] --> REP["report / Perfetto"]
+```
+
+Two decisions shape everything else:
+
+1. **The ring buffer is transport, not storage.** A BPF ring buffer cannot
+   hold history, so the "last *N* seconds" lives in userspace and is refilled
+   continuously. The honest consequence: history exists only while
+   `blackboxd` is running.
+2. **All the hard logic is plain, testable Rust.** The BPF side only stamps a
+   CPU id and copies fixed 64-byte records. Interval reconstruction, latency
+   classification, PSI hysteresis and reporting live in `blackbox-core`,
+   which runs without privileges.
+
+On-CPU time is rebuilt per CPU from consecutive switches. The outgoing task's
+`prev_state` says why it left: preempted or yielded means it was still
+runnable (**scheduler latency**); anything else means it **blocked**. The
+idle task is counted as idle, not as a consumer.
+
+More in [docs/architecture.md](docs/architecture.md).
+
+## Overhead
+
+Blackbox reads every context switch, so its cost follows the machine-wide
+switch rate, not CPU load.
+
+| Scenario (8-core host) | Cost |
+|---|---|
+| Compute-bound workload | essentially none |
+| Switch-heavy workload (400k switches/run) | ~0.6 to 1.7 µs per switch; daemon ~0.6 of one core |
+| Same, with a PID filter | daemon ~0.15% of one core; workload +1.5 to 4.7% |
+| Memory | ~55 MB RSS with BPF attached; history capped at `max_events x 64 B` |
+
+Method, raw numbers and reproduction steps: [docs/overhead.md](docs/overhead.md).
 
 ## Limitations
 
-- **History only while running.** A stall that kills `blackboxd` leaves a short
-  or empty window. This is inherent to holding history in userspace over a BPF
-  ring buffer.
-- **A busy host shortens the window.** The retained window is the smaller of
-  `max_seconds` and `max_events`; at ~500k events/s, 250k events is only ~0.5s.
-  Raise `max_events` (memory permitting) for a longer window on busy machines.
-- **`comm` only.** The kernel name (15 chars), not the full command line. `exec`
-  gets the executed path, but truncated to the same 15-character budget.
-- **Requires BTF** (`CONFIG_DEBUG_INFO_BTF`) for CO-RE.
-- **Two event sources, not three.** `sched_switch` and process lifecycle are
-  captured; I/O event sources (block-queue issue/complete latency) are not.
-  Off by default the daemon traces machine-wide; the PID filter (`[bpf]
-  filter_pids`) narrows that to the listed processes — coarse (pids are not
-  stable across restarts) and not a substitute for cgroup scoping, which is
-  still absent.
+- **History only while running.** A stall that kills `blackboxd` leaves a
+  short or empty window.
+- **Busy hosts shorten the window.** At ~500k switches/s the default 250k
+  events cover ~0.5 s. Raise `max_events` or use a PID filter.
+- **15-character names.** You get the kernel `comm` and a truncated exec path,
+  not full command lines.
+- **Needs BTF** (`CONFIG_DEBUG_INFO_BTF`).
+- **Not yet:** block I/O latency events, cgroup scoping, on-disk history
+  across restarts.
 
-## Testing
+## Documentation
+
+| Doc | Covers |
+|---|---|
+| [Configuration](docs/configuration.md) | Every option, triggers, window sizing, PID filter, dump files |
+| [Architecture](docs/architecture.md) | Threads, failure posture, interval reconstruction, wire formats |
+| [Dump format](docs/dump-format.md) | Schema fields, `prev_state` meanings, completeness counters |
+| [Operations](docs/operations.md) | Running it for real, troubleshooting |
+| [Security](docs/security.md) | Privileges, what is recorded, socket access, dumps at rest |
+| [Overhead](docs/overhead.md) | Benchmark method and results |
+| [BPF build notes](crates/bpf/BUILD_NOTES.md) | Why the BPF build flags are what they are |
+
+## Development
 
 ```sh
-cargo test --workspace            # 180 tests, no privileges needed
+cargo test --workspace                                 # no privileges needed
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+
+sudo scripts/demo.sh    # end to end on a real kernel: start, load, dump, report
+sudo scripts/bench.sh   # overhead benchmark
 ```
 
-The suite covers PSI parsing and hysteresis, the OOM `oom_kill` counter, the
-lifecycle wire decoder and ring, on-CPU interval reconstruction, the bounded
-ring, config validation, dump schema validation (including v1 compatibility),
-retention, the IPC protocol and the text/Perfetto renderers.
-
-The BPF path is validated on a real kernel in privileged Docker:
-
-```sh
-docker run --rm --privileged --pid=host \
-  -v /sys/kernel/btf:/sys/kernel/btf:ro \
-  -v /sys/kernel/tracing:/sys/kernel/tracing:ro \
-  -v "$PWD/target/release/blackboxd:/usr/local/bin/blackboxd:ro" \
-  -v "$PWD/target/release/blackbox:/usr/local/bin/blackbox:ro" \
-  -v "$PWD/blackbox-bpf.o:/opt/blackbox-bpf.o:ro" \
-  -e BLACKBOX_BPF_OBJECT=/opt/blackbox-bpf.o \
-  python:3.12-slim bash -c 'blackboxd & sleep 5; blackbox status; blackbox dump -o /tmp/t.json; blackbox report /tmp/t.json'
+```text
+crates/core     pure analysis: history, reconstruction, PSI/OOM, dumps, reports
+crates/daemon   blackboxd: BPF loader, collector, trigger poller, control socket
+crates/cli      blackbox: start / status / dump / stop / report
+crates/bpf      the tracepoint programs (own toolchain, outside the workspace)
+crates/bench    dependency-free workload for the benchmark
 ```
 
-This is how the tracepoint offsets and the licence requirement below were
-caught — neither is visible from unit tests.
-
-Two scripts drive the same real kernel end to end (both need root):
-
-```sh
-sudo scripts/demo.sh    # start → load → status → dump → report → Perfetto
-sudo scripts/bench.sh   # baseline vs traced overhead on a switch hammer
-```
-
-## Repository layout
-
-```
-crates/core     blackbox-core — pure analysis: events, history, lifecycle, PSI/OOM, dumps, reports
-crates/daemon   blackboxd — BPF collector, trigger poller, IPC server
-crates/cli      blackbox — start / status / dump / stop / report
-crates/bench    blackbox-bench — dependency-free workload for the overhead benchmark
-crates/bpf      blackbox-bpf — the tracepoint program (excluded from the workspace)
-scripts/        reproducible demo and overhead benchmark
-examples/       annotated config
-contrib/        systemd unit
-docs/           design notes (architecture, operations, overhead)
-```
-
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and a BPF build on every
-push and PR; `.github/workflows/release.yml` builds and publishes a tagged
-release with binaries, the BPF object and a `.sha256`.
+CI runs fmt, clippy, tests and a BPF build on every push and pull request.
+Tagged releases publish binaries, the BPF object and checksums.
 
 ## License
 
-The userspace crates (`core`, `daemon`, `cli`) are **MIT** — see
-[`LICENSE`](LICENSE).
+The userspace crates are [MIT](LICENSE).
 
-The BPF object (`crates/bpf`) is **dual MIT/GPL**. Reading the tracepoint
-context uses `bpf_probe_read`, a GPL-only kernel helper, and the kernel refuses
-to load a program that calls it unless the program declares a GPL-compatible
-licence. Declaring `Dual MIT/GPL` keeps the source available under MIT and gives
-the kernel the GPL option it requires; it does **not** make the userspace daemon
-GPL, because the BPF object is a separate program, not linked into `blackboxd`.
-
-Because `bpf_probe_read` is required, "tracepoints only" is not by itself enough
-to avoid GPL-only helpers in Rust; `read_at` is the reason for the dual
-licence. Swapping the tracepoint for a kprobe would not change this.
+The BPF object is dual **MIT/GPL**: reading the tracepoint context needs
+`bpf_probe_read`, a GPL-only kernel helper, so the kernel requires a
+GPL-compatible licence declaration. The source stays available under MIT, and
+the userspace daemon is not affected because the BPF object is a separate
+program, not linked into it.
