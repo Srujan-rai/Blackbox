@@ -116,8 +116,11 @@ Two design decisions matter:
    buffer so the scheduler hot path never branches on an event tag.
 
 On-CPU intervals are rebuilt per CPU from consecutive switches, using
-`prev_state` to separate *scheduler latency* (a runnable task lost the CPU —
-`prev_state == 0`) from *blocked time* (the task slept or waited on I/O).
+`prev_state` to separate *scheduler latency* (a runnable task lost the CPU:
+preempted, which the kernel reports as `TASK_REPORT_MAX` / `R+`, or yielded,
+`prev_state == 0`) from *blocked time* (the task slept or waited on I/O). The
+per-CPU idle task (pid 0, `swapper/N`) is counted as idle time, not as a
+consumer or as latency.
 Lifecycle events ride in their own stream, so a fork storm or a respawning
 daemon is rendered as instant markers next to the scheduling picture.
 
@@ -370,8 +373,16 @@ self-describing, so a trace from last week is still interpretable:
   (child comm on fork, the executed path on exec).
 
 `blackbox report` validates the schema and event ordering before rendering.
-Kernel-side ring-buffer drops are **not currently observable** through aya's
-API, so `events_dropped_kernel` is reported as `0`; it is not faked.
+Kernel-side ring-buffer drops are counted by the BPF program itself (a
+per-CPU `DROPS` map, since aya's ring-buffer API does not expose overflows)
+and land in `events_dropped_kernel` / `lifecycle_dropped_kernel`. An object
+built before that map existed still loads; its drops read `0`.
+
+Dumps are written atomically (temporary file, then rename or link), so an
+interrupted write never leaves a truncated trace. Files in the dump directory
+are mode `0600`; an explicit `blackbox dump -o PATH` is `0644`, and the CLI
+resolves a relative `PATH` against your own working directory. Retention only
+ever deletes `blackbox.json` / `blackbox-*.json`.
 
 ## systemd
 
@@ -409,7 +420,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
   `[ipc].restrict_mutations = false` to widen them to every local user. An
   environment that wants even `status` restricted can pre-create
   `/run/blackbox` with a stricter mode — the daemon never tightens a directory
-  it did not create.
+  it did not create. Dumps in the dump directory are written `0600`, and only
+  root or the daemon owner may choose an explicit `-o` path (the daemon writes
+  it with its own privileges), even when `restrict_mutations = false`.
 - **Self-describing honesty.** Dumps carry their own completeness counters, so
   a trace that lost events says so rather than looking authoritative.
 
@@ -421,7 +434,6 @@ sudo systemctl daemon-reload && sudo systemctl enable --now blackboxd
 - **A busy host shortens the window.** The retained window is the smaller of
   `max_seconds` and `max_events`; at ~500k events/s, 250k events is only ~0.5s.
   Raise `max_events` (memory permitting) for a longer window on busy machines.
-- **Kernel drops read 0.** See above — not observable through aya today.
 - **`comm` only.** The kernel name (15 chars), not the full command line. `exec`
   gets the executed path, but truncated to the same 15-character budget.
 - **Requires BTF** (`CONFIG_DEBUG_INFO_BTF`) for CO-RE.

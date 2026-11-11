@@ -34,8 +34,9 @@ pub struct DumpEvent {
     pub cpu: u32,
     pub prev_pid: u32,
     pub prev_comm: String,
-    /// 0 means the outgoing task was still runnable. See
-    /// [`crate::event::TASK_RUNNING`].
+    /// Raw kernel state of the outgoing task. 0 (yielded) or the
+    /// `TASK_REPORT_MAX` bit (preempted) mean it was still runnable; see
+    /// [`crate::event::is_runnable_state`].
     pub prev_state: i64,
     pub next_pid: u32,
     pub next_comm: String,
@@ -102,12 +103,16 @@ pub struct OverheadInfo {
     /// Lifecycle events dropped from the front because their window was full.
     #[serde(default)]
     pub lifecycle_evicted: u64,
+    /// Lifecycle events the kernel ring buffer could not queue. Absent in
+    /// dumps from daemons that predate kernel-side drop counting.
+    #[serde(default)]
+    pub lifecycle_dropped_kernel: u64,
 }
 
 impl OverheadInfo {
     /// True when the trace may be missing events.
     pub fn lossy(&self) -> bool {
-        self.events_dropped_kernel > 0
+        self.events_dropped_kernel > 0 || self.lifecycle_dropped_kernel > 0
     }
 }
 
@@ -280,6 +285,7 @@ mod tests {
                 events_dropped_kernel: 0,
                 lifecycle_recorded: 0,
                 lifecycle_evicted: 0,
+                lifecycle_dropped_kernel: 0,
             },
             HostSnapshot::default(),
             1_700_000_000_000_000_000,

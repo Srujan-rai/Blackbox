@@ -27,6 +27,10 @@ pub struct StatusInfo {
     pub events_recorded: u64,
     pub events_evicted: u64,
     pub events_dropped_kernel: u64,
+    /// Lifecycle records the kernel ring buffer could not queue.
+    /// `#[serde(default)]` so a new CLI parses an older daemon's reply.
+    #[serde(default)]
+    pub lifecycle_dropped_kernel: u64,
     pub last_trigger_reason: Option<String>,
     pub last_trigger_time: Option<u64>, // unix ns
     pub socket: String,
@@ -93,6 +97,7 @@ mod tests {
             events_recorded: 10,
             events_evicted: 3,
             events_dropped_kernel: 1,
+            lifecycle_dropped_kernel: 2,
             last_trigger_reason: Some("manual".into()),
             last_trigger_time: Some(123),
             socket: "/run/blackbox/blackboxd.sock".into(),

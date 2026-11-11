@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    maps::{Array, MapData, RingBuf},
+    maps::{Array, MapData, PerCpuArray, RingBuf},
     programs::TracePoint,
     Ebpf,
 };
@@ -8,8 +8,37 @@ use aya_log::EbpfLogger;
 use blackbox_core::config::MAX_FILTER_PIDS;
 use std::path::Path;
 
+/// Everything the collector needs from a loaded object.
+pub struct Loaded {
+    /// Owns the program links: dropping it detaches the tracepoints.
+    pub ebpf: Ebpf,
+    pub events: RingBuf<MapData>,
+    pub lifecycle: RingBuf<MapData>,
+    /// Kernel-side drop counters, or `None` for an object built before the
+    /// `DROPS` map existed (it still loads; drops then read 0).
+    pub drops: Option<PerCpuArray<MapData, u64>>,
+}
+
+/// Slots in the BPF `DROPS` per-CPU array; mirrors the BPF crate.
+const DROP_SLOT_SCHED: u32 = 0;
+const DROP_SLOT_LIFECYCLE: u32 = 1;
+
+/// Sum the per-CPU drop counters: `(sched_switch, lifecycle)`.
+///
+/// A read failure yields 0 for that slot rather than an error: the counters
+/// are diagnostics, and a missing reading must not stop collection.
+pub fn read_drops(drops: &PerCpuArray<MapData, u64>) -> (u64, u64) {
+    let sum = |slot: u32| {
+        drops
+            .get(&slot, 0)
+            .map(|values| values.iter().fold(0u64, |acc, v| acc.saturating_add(*v)))
+            .unwrap_or(0)
+    };
+    (sum(DROP_SLOT_SCHED), sum(DROP_SLOT_LIFECYCLE))
+}
+
 /// Load `blackbox-bpf.o`, attach its tracepoints, and hand back both ring
-/// buffers.
+/// buffers plus the drop counters.
 ///
 /// `sched_switch` is required: without it there is no trace at all, so a
 /// failure there is a load failure. The three lifecycle tracepoints
@@ -26,10 +55,7 @@ use std::path::Path;
 /// dropping it detaches the tracepoints. Callers must keep it alive for as
 /// long as they want events (the collector thread holds it for its whole
 /// lifetime, which makes shutdown = detach).
-pub fn load_and_attach(
-    bpf_obj: &Path,
-    filter_pids: &[u32],
-) -> Result<(Ebpf, RingBuf<MapData>, RingBuf<MapData>)> {
+pub fn load_and_attach(bpf_obj: &Path, filter_pids: &[u32]) -> Result<Loaded> {
     let mut ebpf =
         aya::Ebpf::load_file(bpf_obj).with_context(|| format!("loading {}", bpf_obj.display()))?;
     // The aya-log reader is optional and must not fail the load. Our BPF
@@ -70,7 +96,25 @@ pub fn load_and_attach(
         .take_map("LIFECYCLE")
         .ok_or_else(|| anyhow!("map 'LIFECYCLE' not found"))?;
     let lifecycle = RingBuf::try_from(lifecycle_map)?;
-    Ok((ebpf, ringbuf, lifecycle))
+    // Taken only now, after every program is loaded (see configure_filter on
+    // why taking a map earlier breaks later loads). Optional so an object
+    // built before DROPS existed keeps working.
+    let drops = match ebpf.take_map("DROPS") {
+        Some(map) => match PerCpuArray::try_from(map) {
+            Ok(array) => Some(array),
+            Err(err) => {
+                eprintln!("blackboxd: DROPS map unusable, kernel drops will read 0: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+    Ok(Loaded {
+        ebpf,
+        events: ringbuf,
+        lifecycle,
+        drops,
+    })
 }
 
 /// Fill the kernel-side `FILTER` array from the config.

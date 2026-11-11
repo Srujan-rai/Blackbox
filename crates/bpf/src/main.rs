@@ -27,7 +27,7 @@
 use aya_ebpf::helpers::gen::bpf_ktime_get_ns;
 use aya_ebpf::helpers::{bpf_get_current_comm, bpf_probe_read_kernel_str_bytes};
 use aya_ebpf::macros::{map, tracepoint};
-use aya_ebpf::maps::{Array, RingBuf};
+use aya_ebpf::maps::{Array, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TracePointContext;
 use aya_ebpf::EbpfContext;
 
@@ -88,6 +88,26 @@ pub struct Lifecycle {
 }
 
 const _: () = assert!(core::mem::size_of::<Lifecycle>() == 64);
+
+/// Kernel-side drop counters: slot 0 counts `sched_switch` records and slot 1
+/// lifecycle records that could not be queued because the ring buffer was
+/// full. Per-CPU so the increment needs no atomics on the hot path; the
+/// daemon sums the CPUs. Without this, a ring buffer that overflowed during
+/// the very stall being traced would leave no trace of having done so.
+const DROP_SLOT_SCHED: u32 = 0;
+const DROP_SLOT_LIFECYCLE: u32 = 1;
+
+#[map]
+static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2, 0);
+
+#[inline(always)]
+fn count_drop(slot: u32) {
+    if let Some(counter) = DROPS.get_ptr_mut(slot) {
+        // Per-CPU slot, and BPF programs do not migrate mid-run, so a plain
+        // read-modify-write cannot race.
+        unsafe { *counter += 1 };
+    }
+}
 
 /// Optional PID filter, filled by the daemon from `[bpf].filter_pids`.
 ///
@@ -195,7 +215,9 @@ pub fn sched_switch(ctx: TracePointContext) -> u32 {
     // would risk stalling the scheduler, and on the ring buffer an error means
     // the reader is too far behind anyway. The count of these is what
     // `events_dropped_kernel` in the dump reports.
-    let _ = EVENTS.output(&ev, 0);
+    if EVENTS.output(&ev, 0).is_err() {
+        count_drop(DROP_SLOT_SCHED);
+    }
 
     0
 }
@@ -203,7 +225,9 @@ pub fn sched_switch(ctx: TracePointContext) -> u32 {
 /// Try to publish a lifecycle record. Failure (kernel-side ring full) drops it;
 /// same reasoning as `EVENTS.output`.
 fn emit_lifecycle(ev: &Lifecycle) {
-    let _ = LIFECYCLE.output(ev, 0);
+    if LIFECYCLE.output(ev, 0).is_err() {
+        count_drop(DROP_SLOT_LIFECYCLE);
+    }
 }
 
 /// Copy a tracepoint `__data_loc` string (the low 16 bits hold the byte offset

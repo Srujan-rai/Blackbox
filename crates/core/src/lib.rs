@@ -24,7 +24,7 @@ pub mod report;
 
 pub use config::Config;
 pub use dump::{Dump, DumpEvent, OverheadInfo, TriggerInfo, WindowInfo, SCHEMA_VERSION};
-pub use event::{SchedSwitch, TASK_RUNNING};
+pub use event::{is_runnable_state, SchedSwitch, IDLE_PID, TASK_REPORT_MAX, TASK_RUNNING};
 pub use history::HistoryRing;
 pub use hostinfo::{collect, uptime_ns};
 pub use ipc::{

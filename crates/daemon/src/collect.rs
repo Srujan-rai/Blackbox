@@ -19,8 +19,8 @@ use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags};
 use std::os::fd::AsFd;
 
-use crate::bpf::{describe_failure, load_and_attach};
-use crate::runtime::Runtime;
+use crate::bpf::{describe_failure, load_and_attach, Loaded};
+use crate::runtime::{persist, Runtime};
 
 /// What the IPC thread and both workers share.
 ///
@@ -56,6 +56,33 @@ pub fn lock_runtime(runtime: &SharedRuntime) -> MutexGuard<'_, Runtime> {
     runtime.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Take a dump without holding the runtime lock while it is written.
+///
+/// Three phases: copy the window out under the lock (cheap), build and write
+/// the JSON with no lock held (the slow part), then re-take the lock briefly
+/// to record the trigger for `status`. The collector keeps draining the
+/// kernel ring buffer throughout, which matters because dumps happen exactly
+/// when the machine is busiest.
+pub fn dump_now(
+    runtime: &SharedRuntime,
+    reason: &str,
+    detail: Option<&str>,
+    requested: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let (capture, dump_cfg) = {
+        let rt = lock_runtime(runtime);
+        (rt.capture(reason, detail), rt.config().dump.clone())
+    };
+    let dump = capture.into_dump();
+    let path = persist(&dump_cfg, &dump, requested)?;
+    lock_runtime(runtime).note_trigger(&dump);
+    Ok(path)
+}
+
+/// How often the kernel-side drop counters are read. They only matter for
+/// status and dumps, so once a second is plenty.
+const DROP_REFRESH: Duration = Duration::from_secs(1);
+
 /// How long each wait blocks before the stop flag is re-checked. This is
 /// also the idle wakeup rate, so it stays small but need not be tiny.
 const IDLE_POLL_MS: u16 = 250;
@@ -75,7 +102,12 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
     // The pid filter is fixed for the lifetime of the daemon; take it from the
     // config once so the load sees a stable picture.
     let filter_pids = lock_runtime(&runtime).config().bpf.filter_pids.clone();
-    let (_ebpf, mut ringbuf, mut lifecycle) = match load_and_attach(&object, &filter_pids) {
+    let Loaded {
+        ebpf: _ebpf,
+        events: mut ringbuf,
+        mut lifecycle,
+        drops,
+    } = match load_and_attach(&object, &filter_pids) {
         Ok(loaded) => loaded,
         Err(err) => {
             let reason = describe_failure(&err, &object);
@@ -85,6 +117,13 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
         }
     };
     lock_runtime(&runtime).set_bpf_status(true, None);
+    if drops.is_none() {
+        eprintln!(
+            "blackboxd: {} has no DROPS map (older build); kernel-side drops will read 0",
+            object.display()
+        );
+    }
+    let mut last_drop_read = Instant::now();
     if filter_pids.is_empty() {
         eprintln!(
             "blackboxd: collecting sched_switch events via {}",
@@ -176,6 +215,14 @@ pub fn run_collector(runtime: SharedRuntime, object: PathBuf) {
             }
         }
 
+        if let Some(drops) = drops.as_ref() {
+            if last_drop_read.elapsed() >= DROP_REFRESH {
+                last_drop_read = Instant::now();
+                let (sched, life) = crate::bpf::read_drops(drops);
+                lock_runtime(&runtime).set_kernel_drops(sched, life);
+            }
+        }
+
         if batch.is_empty() && lifecycle_batch.is_empty() {
             continue;
         }
@@ -244,8 +291,8 @@ pub fn run_triggers(runtime: SharedRuntime) {
                 // common case and is simply a no-op `for`.
                 let fired = lock_runtime(&runtime).observe_psi(&snapshot);
                 for trigger in fired {
-                    let mut rt = lock_runtime(&runtime);
-                    match rt.write_psi_dump(&trigger) {
+                    let detail = trigger.describe();
+                    match dump_now(&runtime, &trigger.reason(), Some(&detail), None) {
                         Ok(path) => eprintln!(
                             "blackboxd: PSI trigger {} fired, wrote {}",
                             trigger.reason(),
@@ -279,9 +326,10 @@ pub fn run_triggers(runtime: SharedRuntime) {
                             "blackboxd: OOM counter reads recovered (was failing: {previous})"
                         );
                     }
-                    if let Some(fired) = lock_runtime(&runtime).observe_oom(total) {
-                        let mut rt = lock_runtime(&runtime);
-                        match rt.write_oom_dump(&fired) {
+                    let fired = lock_runtime(&runtime).observe_oom(total);
+                    if let Some(fired) = fired {
+                        let detail = fired.describe();
+                        match dump_now(&runtime, &fired.reason(), Some(&detail), None) {
                             Ok(path) => {
                                 eprintln!("blackboxd: OOM trigger fired, wrote {}", path.display())
                             }

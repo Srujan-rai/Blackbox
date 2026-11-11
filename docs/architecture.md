@@ -96,10 +96,17 @@ A task is *on CPU* on `c` from the switch that made it `next` until the switch
 that makes it `prev`. Consecutive records are paired per CPU to produce those
 intervals; the `prev_state` on the closing record says why the task left:
 
-- `prev_state == 0` — still runnable, so this is **scheduler delay**: the task
-  wanted the CPU and did not get it.
+- still runnable, so this is **scheduler delay**: the task wanted the CPU and
+  did not get it. That is `prev_state & 0x100` (`TASK_REPORT_MAX`, the
+  kernel's marker for an involuntary preemption, shown as `R+` by ftrace) or
+  `prev_state == 0` (a voluntary yield). Preemption is the common case;
+  testing only for 0 misfiles it as blocking.
 - anything else — the task **blocked** (sleep, I/O, …), which is *not* a
   scheduling problem and is reported separately.
+
+pid 0 is the per-CPU idle task: every CPU has one, so it is "on CPU" in
+parallel and is excluded from rankings, latency and the Perfetto tracks, and
+reported as idle time instead.
 
 This is why the CPU id is stamped in BPF: it is not in the tracepoint payload,
 and intervals cannot be rebuilt per CPU without it.
