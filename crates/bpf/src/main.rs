@@ -25,7 +25,9 @@
 #![no_main]
 
 use aya_ebpf::helpers::gen::bpf_ktime_get_ns;
-use aya_ebpf::helpers::{bpf_get_current_comm, bpf_probe_read_kernel_str_bytes};
+use aya_ebpf::helpers::{
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel_str_bytes,
+};
 use aya_ebpf::macros::{map, tracepoint};
 use aya_ebpf::maps::{Array, PerCpuArray, RingBuf};
 use aya_ebpf::programs::TracePointContext;
@@ -253,28 +255,41 @@ fn read_data_loc_name(ctx: &TracePointContext, loc: u32) -> [u8; 16] {
     name
 }
 
-/// `fork` — a new task was created. Offsets match
-/// /sys/kernel/tracing/events/sched/sched_process_fork/format:
-///   common header                    0..8
-///   parent_comm[16]                   8
-///   parent_pid (pid_t)               24
-///   child_comm[16]                   28
-///   child_pid (pid_t)                44
+/// Where `child_pid` sits in the `sched_process_fork` record, written by the
+/// daemon from the tracepoint's `format` file before anything attaches.
+///
+/// The layout is not stable: older kernels store both comms inline as
+/// `char[16]` (child_pid at 44), newer ones as `__data_loc` strings (child_pid
+/// at 20). A fixed offset silently reads string bytes as pids, so the offset
+/// is looked up at runtime instead. 0 = unknown, use the classic 44.
+#[map]
+static FORK_LAYOUT: Array<u32> = Array::with_max_entries(1, 0);
+
+const FORK_CHILD_PID_DEFAULT: u32 = 44;
+
+/// `fork` — a new task was created.
+///
+/// The tracepoint fires in the parent's context, so the parent's pid and comm
+/// come from helpers rather than the record, and the child's comm is the
+/// parent's (it is copied at fork; a later exec renames it). That leaves
+/// `child_pid` as the only field read from the record, at the offset the
+/// daemon resolved (see `FORK_LAYOUT`).
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    let parent_comm: [u8; 16] = match unsafe { ctx.read_at(8) } {
-        Ok(v) => v,
-        Err(_) => return 0,
+    let parent_pid = bpf_get_current_pid_tgid() as u32;
+    let comm = match bpf_get_current_comm() {
+        Ok(c) => c,
+        Err(_) => [0u8; 16],
     };
-    let parent_pid: u32 = match unsafe { ctx.read_at(24) } {
-        Ok(v) => v,
-        Err(_) => return 0,
+    let mut child_off = match FORK_LAYOUT.get(0) {
+        Some(off) => *off,
+        None => 0,
     };
-    let child_comm: [u8; 16] = match unsafe { ctx.read_at(28) } {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    let child_pid: u32 = match unsafe { ctx.read_at(44) } {
+    // A tracepoint record is small; anything else is a bogus map value.
+    if child_off == 0 || child_off > 1024 {
+        child_off = FORK_CHILD_PID_DEFAULT;
+    }
+    let child_pid: u32 = match unsafe { ctx.read_at(child_off as usize) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
@@ -288,8 +303,8 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
         pid: parent_pid,
         peer_pid: child_pid,
         _pad: 0,
-        comm: parent_comm,
-        name: child_comm,
+        comm,
+        name: comm,
     });
     0
 }

@@ -21,6 +21,7 @@ pub mod oom;
 pub mod perfetto;
 pub mod psi;
 pub mod report;
+pub mod tracefs;
 
 pub use config::Config;
 pub use dump::{Dump, DumpEvent, OverheadInfo, TriggerInfo, WindowInfo, SCHEMA_VERSION};

@@ -131,8 +131,13 @@ source of those numbers and they are checked in review.
 The same discipline applies to the second record, `Lifecycle`
 (`blackbox_core::lifecycle::LifecycleRecord`, also 64 bytes):
 
-- `sched_process_fork` — `parent_comm` 8, `parent_pid` 24, `child_comm` 28,
-  `child_pid` 44.
+- `sched_process_fork` — the layout differs across kernels: older ones store
+  both comms inline (`child_pid` at 44), newer ones as `__data_loc` strings
+  (`child_pid` at 20), and a fixed offset reads string bytes as pids. So the
+  parent's pid and comm come from helpers (the tracepoint fires in the
+  parent), the child's comm is the parent's, and the daemon parses
+  `child_pid`'s offset from the event's `format` file into the `FORK_LAYOUT`
+  map before attaching (default 44 if unreadable).
 - `sched_process_exec` — `filename` (a `__data_loc` whose low 16 bits are the
   byte offset of the string inside the record) 8, `pid` 12, `old_pid` 16. The
   string is read with `bpf_probe_read_kernel_str` at that dynamic offset and

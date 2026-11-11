@@ -6,6 +6,7 @@ use aya::{
 };
 use aya_log::EbpfLogger;
 use blackbox_core::config::MAX_FILTER_PIDS;
+use blackbox_core::tracefs;
 use std::path::Path;
 
 /// Everything the collector needs from a loaded object.
@@ -76,6 +77,7 @@ pub fn load_and_attach(bpf_obj: &Path, filter_pids: &[u32]) -> Result<Loaded> {
     // between attach and map-write would otherwise let a handful of unfiltered
     // records into the trace.
     configure_filter(&mut ebpf, filter_pids)?;
+    configure_fork_layout(&mut ebpf);
 
     attach_required(&mut ebpf, "sched_switch", "sched", "sched_switch")?;
     for event in [
@@ -140,6 +142,29 @@ fn configure_filter(ebpf: &mut Ebpf, filter_pids: &[u32]) -> Result<()> {
         filter.set((i + 1) as u32, *pid, 0)?;
     }
     Ok(())
+}
+
+/// Tell the fork program where `child_pid` lives on this kernel.
+///
+/// Read from tracefs because the record's layout differs across kernels (see
+/// `FORK_LAYOUT` in the BPF crate). Best-effort: a missing map (older object)
+/// or unreadable format leaves the BPF default in place, and fork is a
+/// best-effort tracepoint anyway.
+fn configure_fork_layout(ebpf: &mut Ebpf) {
+    let Some(offset) = tracefs::read_field_offset("sched", "sched_process_fork", "child_pid")
+    else {
+        eprintln!(
+            "blackboxd: cannot read sched_process_fork's format; assuming the classic layout"
+        );
+        return;
+    };
+    let Some(map) = ebpf.map_mut("FORK_LAYOUT") else {
+        return;
+    };
+    let result = Array::<&mut MapData, u32>::try_from(map).and_then(|mut a| a.set(0, offset, 0));
+    if let Err(err) = result {
+        eprintln!("blackboxd: cannot configure the fork layout: {err}");
+    }
 }
 
 /// Look up a tracepoint program, load it and attach it to its event.
